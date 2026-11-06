@@ -491,6 +491,51 @@ static void t_motion_hid(void) {
     dm_pad_players(1); g_phone_mode = -1;
 }
 
+static void t_motion_dual_joycon(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    dm_motion_clear(0); dm_motion_clear_hid(0);
+    uint32_t saved_styles = g_styles_supported;
+    h_hid_SetStyles(STYLE_JOYDUAL);
+    CHECK(style_of(0) == STYLE_JOYDUAL, "style_of returns STYLE_JOYDUAL when game requires it");
+
+    uint32_t handles[2] = {0}; uint32_t id = 0;
+    CHECK(h_hid_SixHandles(handles, 2, &id, STYLE_JOYDUAL) == 2, "two six-axis handles for JoyDual");
+    CHECK((handles[0] >> 16 & 0xff) == 0, "first handle is device 0 (Left)");
+    CHECK((handles[1] >> 16 & 0xff) == 1, "second handle is device 1 (Right)");
+
+    SixAxisState st_left, st_right;
+    int ret_l = h_hid_SixStates(&st_left, 1, &handles[0]);
+    int ret_r = h_hid_SixStates(&st_right, 1, &handles[1]);
+    CHECK(ret_l == 1 && st_left.acc[2] == -1, "Left Joy-Con initially flat");
+    CHECK(ret_r == 1 && st_right.acc[2] == -1, "Right Joy-Con initially flat");
+
+    motion_now += 1000000;
+    float l_acc[3] = {0.8f, 0, -0.6f}, l_turn[3] = {0, 0, 1.0f};
+    float r_acc[3] = {-0.4f, 0.5f, -0.7f}, r_turn[3] = {0, 2.0f, 0};
+    dm_motion_set_hid_device(0, 0, l_acc, l_turn, motion_now);
+    dm_motion_set_hid_device(0, 1, r_acc, r_turn, motion_now);
+
+    h_hid_SixStates(&st_left, 1, &handles[0]);
+    h_hid_SixStates(&st_right, 1, &handles[1]);
+    CHECK(fabsf(st_left.acc[0] - 0.8f) < 1e-4f, "Left Joy-Con has independent left acceleration");
+    CHECK(fabsf(st_right.acc[0] - (-0.4f)) < 1e-4f, "Right Joy-Con has independent right acceleration");
+    CHECK(fabsf(st_left.gyro[2] - (1.0f / (2 * (float)M_PI))) < 1e-4f, "Left Joy-Con has left gyro");
+    CHECK(fabsf(st_right.gyro[1] - (2.0f / (2 * (float)M_PI))) < 1e-4f, "Right Joy-Con has right gyro");
+
+    dm_motion_clear_hid_device(0, 0);
+    h_hid_SixStates(&st_left, 1, &handles[0]);
+    h_hid_SixStates(&st_right, 1, &handles[1]);
+    CHECK(st_left.acc[0] == 0 && st_left.acc[2] == -1, "Left Joy-Con cleared to flat");
+    CHECK(fabsf(st_right.acc[0] - (-0.4f)) < 1e-4f, "Right Joy-Con still active");
+
+    dm_motion_clear_hid_device(0, 1);
+    h_hid_SixStates(&st_right, 1, &handles[1]);
+    CHECK(st_right.acc[0] == 0 && st_right.acc[2] == -1, "Right Joy-Con cleared to flat");
+
+    h_hid_SetStyles(saved_styles);
+    g_phone_mode = -1;
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
@@ -500,6 +545,7 @@ int main(void) {
     t_rumble_log();
     t_motion_threads();
     t_motion_live();
+    t_motion_dual_joycon();
     t_motion_hid();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing

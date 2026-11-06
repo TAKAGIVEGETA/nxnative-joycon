@@ -33,7 +33,11 @@ void dm_motion_clear(int player);   // clears GameController motion; another fre
 // Passive controller HID, already in the Switch frame (G, rad/s). sample_ns is the sample's host now_ns() time, not the packet's arrival; stale / reordered samples are ignored.
 // Kept separate from GameController and the phone; used while GameController supplies no fresh motion for that player. DM_MOTION_AXES / ACC_SIGN apply only to GameController.
 void dm_motion_set_hid(int player, const float acc[3], const float rot[3], uint64_t sample_ns);
+void dm_motion_set_hid_device(int player, int device, const float acc[3], const float rot[3], uint64_t sample_ns);
 void dm_motion_clear_hid(int player);
+void dm_motion_clear_hid_device(int player, int device);
+int dm_joycon_is_dual(void);
+int dm_joycon_count(void);
 uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
 // A library applet in front of the game (the offline web page, hle_web.c / web_apple.m): while held, the game reads no buttons and centred sticks on every npad, as an application
 // out of focus does, and presses made meanwhile are dropped when the hold ends. dm_input_peek reads what the applet sees: every path ORed (any controller drives it), each stick

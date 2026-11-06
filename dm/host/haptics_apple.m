@@ -310,6 +310,10 @@ static BOOL ds4_route(int p, GCController *controller) {
 static void apply(dm_haptic_state s) {
     dispatch_async(queue, ^{ @autoreleasepool {
         if (s.epoch != dm_haptics_epoch(s.player)) return;
+        if (dm_joycon_has_haptics()) {
+            dm_joycon_apply_haptics(s);
+            return;
+        }
         NSArray<DmRumbleChannel *> *out = channels[s.player];
 #if !TARGET_OS_IPHONE
         if ([out.firstObject isKindOfClass:DmDs4Channel.class]) { ds4_apply(s); return; }

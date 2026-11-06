@@ -296,7 +296,21 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
     if (id == connected_id()) return 0;
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
 }
-static uint32_t style_for_player(uint32_t id, int p) { return p < 0 ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+static uint32_t g_styles_supported = 0xffffffffu;
+__attribute__((weak)) int dm_joycon_is_dual(void) { return 0; }
+__attribute__((weak)) int dm_joycon_count(void) { return 0; }
+static uint32_t style_for_player(uint32_t id, int p) {
+    if (p < 0) return 0;
+    if (id == NPAD_HANDHELD) return STYLE_HANDHELD;
+    if (dm_joycon_is_dual()) {
+        if (g_styles_supported & STYLE_JOYDUAL) return STYLE_JOYDUAL;
+        if (g_styles_supported & STYLE_FULLKEY) return STYLE_FULLKEY;
+        return STYLE_JOYDUAL;
+    }
+    if (g_styles_supported & STYLE_FULLKEY) return STYLE_FULLKEY;
+    if (g_styles_supported & STYLE_JOYDUAL) return STYLE_JOYDUAL;
+    return STYLE_FULLKEY;
+}
 static uint32_t style_of(uint32_t id) { return style_for_player(id, player_of(id)); }
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of two sources is deflected more
@@ -511,7 +525,6 @@ HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; 
     for (int p = 1; p < DM_PLAYERS; p++) if ((uint32_t)reported(p) != (was >> p & 1)) style_changed((uint32_t)p);
     note_merged();
 }
-static uint32_t g_styles_supported = 0xffffffffu;
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
     if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
@@ -566,7 +579,7 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 enum { MOTION_STALE_NS = 300000000 };
 typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
-static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
+static live_motion g_hid_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 ... 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}}};
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
 static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
@@ -578,12 +591,12 @@ static void motion_env(void) {
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
 }
-static void motion_set(int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
-    if (p < 0 || p >= DM_PLAYERS || (source == 1 && p)) return;
+static void motion_set(int p, int dev, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
+    if (p < 0 || p >= DM_PLAYERS || (source == 1 && p) || dev < 0 || dev > 1) return;
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
     static motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
     // Each transport owns its orientation. HID batches carry three sample times; arrival time controls freshness, never their integration intervals.
-    live_motion *m = source == 1 ? &g_phone_motion : source == 2 ? &g_hid_motion[p] : &g_motion[p];
+    live_motion *m = source == 1 ? &g_phone_motion : source == 2 ? &g_hid_motion[p][dev] : &g_motion[p];
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
@@ -593,22 +606,29 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
-        LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
-            source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
+        LOG("[hid] motion player 1 dev %d (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
+            dev, source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
     m->last_ns = t; m->received_ns = now;
     pthread_mutex_unlock(&m->mu);
 }
-void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
-void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1, 0); }
-void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, acc, rot, 2, t); }
+void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, 0, acc, rot, 0, 0); }
+void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, 0, acc, rot, 1, 0); }
+void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, 0, acc, rot, 2, t); }
+void dm_motion_set_hid_device(int p, int dev, const float acc[3], const float rot[3], uint64_t t) { if (t && (dev == 0 || dev == 1)) motion_set(p, dev, acc, rot, 2, t); }
 void dm_motion_clear(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
     pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; pthread_mutex_unlock(&g_motion[p].mu);
 }
 void dm_motion_clear_hid(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
-    pthread_mutex_lock(&g_hid_motion[p].mu); g_hid_motion[p].last_ns = 0; pthread_mutex_unlock(&g_hid_motion[p].mu);
+    for (int d = 0; d < 2; d++) {
+        pthread_mutex_lock(&g_hid_motion[p][d].mu); g_hid_motion[p][d].last_ns = 0; pthread_mutex_unlock(&g_hid_motion[p][d].mu);
+    }
+}
+void dm_motion_clear_hid_device(int p, int dev) {
+    if (p < 0 || p >= DM_PLAYERS || dev < 0 || dev > 1) return;
+    pthread_mutex_lock(&g_hid_motion[p][dev].mu); g_hid_motion[p][dev].last_ns = 0; pthread_mutex_unlock(&g_hid_motion[p][dev].mu);
 }
 static uint64_t motion_copy(live_motion *m, motion_state *out) {   // copies a source while it is fresh; returns its timestamp
     uint64_t t;
@@ -618,19 +638,29 @@ static uint64_t motion_copy(live_motion *m, motion_state *out) {   // copies a s
     pthread_mutex_unlock(&m->mu);
     return t;
 }
-static int motion_live(int p, motion_state *out) {
+static int motion_live_dev(int p, int dev, motion_state *out) {
     if (p < 0 || p >= DM_PLAYERS) return 0;
+    if (dev < 0 || dev > 1) dev = 0;
     pthread_once(&g_motion_once, motion_env);
-    if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) != 0;
+    if (!p && g_phone_mode > 0 && dev == 0) return motion_copy(&g_phone_motion, out) != 0;
     // Match the button path: in a one-player game, a controller in another slot also drives player 1.
     uint32_t src = p ? 1u << p : 1u | merged_players(); uint64_t newest = 0;
     for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) {
-        motion_state st; uint64_t t = motion_copy(&g_motion[i], &st);
-        if (!t) t = motion_copy(&g_hid_motion[i], &st);
+        motion_state st; uint64_t t = 0;
+        if (dev == 0) {
+            t = motion_copy(&g_motion[i], &st);
+            if (!t) t = motion_copy(&g_hid_motion[i][0], &st);
+        } else {
+            t = motion_copy(&g_hid_motion[i][1], &st);
+            if (!t) t = motion_copy(&g_motion[i], &st);
+        }
         if (t > newest) { newest = t; *out = st; }
     }
     if (newest) return 1;
-    return !p && g_phone_mode < 0 && motion_copy(&g_phone_motion, out);
+    return !p && g_phone_mode < 0 && dev == 0 && motion_copy(&g_phone_motion, out);
+}
+static int motion_live(int p, motion_state *out) {
+    return motion_live_dev(p, 0, out);
 }
 static void six_sample_live(SixAxisState *s, int64_t samp, const motion_state *ms, int shakes) {
     memset(s, 0, sizeof *s);
@@ -663,8 +693,9 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
     int pl = player_of(h >> 8 & 0xff), shakes = pl == 0;
+    uint32_t dev = (h >> 16) & 0xff;
     motion_state ms;
-    if (motion_live(pl, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
+    if (motion_live_dev(pl, dev, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
     for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
     return n;
 }
@@ -719,13 +750,14 @@ HLE_FORCE("_ZN2nn3hid14GetNmouseStateEPNS0_11NmouseStateENS0_12NmouseHandleE", "
 HLE_FORCE("_ZN2nn3hid13GetNpadIdTypeEPjNS0_12NmouseHandleE", "mouse's controller: none (no device)", bool, h_hid_NmouseNpad, uint32_t *out, uint64_t h) { (void)out; (void)h; return false; }
 HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "six-axis sensor states: every requested entry, newest first",
           int, h_hid_SixStates, SixAxisState *out, int n, const uint32_t *h) { return six_states(out, n, *h); }
-// Vibration handles: byte 0 = SDK style index (FullKey 3, Handheld 4), byte 1 = npad id, byte 2 = motor.
+// Vibration handles: byte 0 = SDK style index (FullKey 3, Handheld 4, JoyDual 5), byte 1 = npad id, byte 2 = motor.
 // See libnx hid.c _hidGetVibrationDeviceHandles. Only the styles this host connects are exposed.
 static uint32_t vib_targets(uint32_t h) {
     unsigned type = h & 0xff, id = h >> 8 & 0xff, motor = h >> 16 & 0xff;
-    if (h >> 24 || motor > 1 || (type != 3 && type != 4)) return 0;
+    if (h >> 24 || motor > 1 || (type != 3 && type != 4 && type != 5)) return 0;
     int p = player_of(id);
-    if (style_for_player(id, p) != (1u << (type - 3))) return 0;
+    uint32_t expected_style = type == 5 ? STYLE_JOYDUAL : type == 4 ? STYLE_HANDHELD : STYLE_FULLKEY;
+    if (!(style_for_player(id, p) & expected_style)) return 0;
     return dm_haptics_available() & (p == 0 ? 1u | merged_players() : 1u << p);
 }
 static void vib_send(const uint32_t *handles, const dm_vibration *values, int n) {
@@ -764,7 +796,7 @@ HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiR
         if (getenv("DM_RUMBLE_LOG") && id) LOG("rumble: game asked for vibration handles of npad %u style %#x: none (connected style %#x, %s)", *id, style, style_of(*id), dm_haptics_has_output() ? "output ready" : "no output yet");
         return 0;
     }
-    uint32_t base = (*id << 8) | (*id == NPAD_HANDHELD ? 4u : 3u);
+    uint32_t base = (*id << 8) | (*id == NPAD_HANDHELD ? 4u : (style & STYLE_JOYDUAL) ? 5u : 3u);
     int count = n < 2 ? n : 2;
     for (int i = 0; i < count; i++) h[i] = base | (uint32_t)i << 16;
     if (getenv("DM_RUMBLE_LOG")) LOG("rumble: game asked for vibration handles of npad %u style %#x: %d, first %#x", *id, style, count, h[0]);
@@ -867,8 +899,10 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states,
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
 HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless player 1's is shaking or a live controller is turning", unsigned, h_hid_SixRest, const uint32_t *h) {
-    int pl = player_of(*h >> 8 & 0xff); motion_state ms;
-    if (motion_live(pl, &ms)) return fabsf(ms.gyro[0]) + fabsf(ms.gyro[1]) + fabsf(ms.gyro[2]) < 0.01f && !(pl == 0 && shaking(guest_ns()));
+    int pl = player_of(*h >> 8 & 0xff);
+    uint32_t dev = (*h >> 16) & 0xff;
+    motion_state ms;
+    if (motion_live_dev(pl, dev, &ms)) return fabsf(ms.gyro[0]) + fabsf(ms.gyro[1]) + fabsf(ms.gyro[2]) < 0.01f && !(pl == 0 && shaking(guest_ns()));
     return pl != 0 || !shaking(guest_ns());
 }
 // The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states

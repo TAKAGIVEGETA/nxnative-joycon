@@ -21,6 +21,7 @@
 #include "haptics_apple.h"
 #include "motion_apple.h"
 #include "motion_pro_mac.h"
+#include "joycon_mac.h"
 #include "pad_apple.h"
 #include "pad_hid_mac.h"
 #include "home_quit.h"
@@ -208,11 +209,13 @@ static int merge_pads_left(GCController *gone) {
     for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) return 1;
     return 0;
 }
+static int is_joycon_controller(GCController *c) { return [c.vendorName containsString:@"Joy-Con"]; }
+
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil on a connect)
 static void pads_changed(GCController *gone) {
     if (g_merge) {
         int any = 0;
-        for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
+        for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone && !is_joycon_controller(c)) {
             any = 1; pad_keep_system_buttons(c); c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             dm_motion_attach(c, 0);   // every controller is player 1: the last one moved drives its six-axis sensor
             pad_read(c.extendedGamepad);
@@ -231,7 +234,7 @@ static void pads_changed(GCController *gone) {
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
         dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
     }
-    for (GCController *c in now) if (c.extendedGamepad && c != gone && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
+    for (GCController *c in now) if (c.extendedGamepad && c != gone && !is_joycon_controller(c) && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
         g_held[p] = c; pad_keep_system_buttons(c);
@@ -418,6 +421,7 @@ static void pads_start(void) {
     pads_changed(nil);
     hq_log_setting();
     dm_motion_pro_start(pro_devices_changed);
+    dm_joycon_start();
     hidpad_start();
 }
 

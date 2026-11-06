@@ -5,3 +5,5 @@
 void dm_haptics_apple_init(void);
 void dm_haptics_apple_controller(int player, GCController *controller);
 void dm_haptics_apple_shutdown(void);
+int dm_joycon_has_haptics(void);
+void dm_joycon_apply_haptics(dm_haptic_state s);

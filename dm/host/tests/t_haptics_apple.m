@@ -45,6 +45,8 @@ static IOReturn test_device_report(IOHIDDeviceRef d, IOHIDReportType t, CFIndex 
 #undef clock_gettime
 #undef dispatch_time
 #undef dispatch_after
+int dm_joycon_has_haptics(void) { return 0; }
+void dm_joycon_apply_haptics(dm_haptic_state s) { (void)s; }
 
 @interface TestTimer : NSObject
 @property dispatch_time_t deadline;

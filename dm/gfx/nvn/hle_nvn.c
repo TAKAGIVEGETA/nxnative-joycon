@@ -346,7 +346,14 @@ NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.le
 NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
 NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
 NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) { TB(b)->d.stride = (uint32_t)s; }
-NVN(nvnTextureBuilderSetStorage, void, NVNtextureBuilder *b, NVNmemoryPool *p, ptrdiff_t off) { TB(b)->pool = (pool_t *)p; TB(b)->off = off; }
+NVN(nvnTextureBuilderSetStorage, void, NVNtextureBuilder *b, NVNmemoryPool *p, ptrdiff_t off) {
+    const pool_t *pool = (const pool_t *)p;
+    if (pool && pool->magic != MAGIC('P', 'O', 'O', 'L')) {
+        LOG("[RED] TextureBuilderSetStorage: invalid memory pool %p (magic %#x)", (const void *)p, pool->magic);
+        pool = NULL;
+    }
+    TB(b)->pool = (pool_t *)pool; TB(b)->off = off;
+}
 NVN(nvnTextureBuilderSetPackagedTextureLayout, void, NVNtextureBuilder *b, const NVNpackagedTextureLayout *l) {
     TB(b)->has_layout = l != NULL; if (l) memcpy(TB(b)->layout, l->layout, 8);
     TB(b)->d.pkg_block_h = l ? l->layout[0] + 1 : 0;
@@ -509,14 +516,19 @@ int nvn_flushed(const void *p, uint64_t n) {   // whether the CPU flushed any of
 }
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
+    const pool_t *pool = s->pool;
+    if (pool && pool->magic != MAGIC('P', 'O', 'O', 'L')) {
+        LOG("[RED] TextureInitialize: builder has invalid memory pool %p (magic %#x)", (const void *)pool, pool->magic);
+        pool = NULL;
+    }
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
     //   previously every init created a new private MTLTexture and the old one stayed in the serial table forever, so GPU memory grew about 13 MB per frame (killed by the memory watchdog at 24 GB)
     if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); mtl_tex_release(o); }
     memset(o, 0, sizeof *o);
-    o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
+    o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = (pool_t *)pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
     nvn_tex_layout(&o->d, &o->L);
-    o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+    o->mem = pool && pool->mem ? pool->mem + s->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
@@ -543,13 +555,19 @@ NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth;
 NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
 NVN(nvnTextureGetStride, ptrdiff_t, const NVNtexture *t) { return (ptrdiff_t)CTX(t)->d.stride; }   // the row stride of a linear texture as built (0 for block-linear ones)
 // The queries below are used by Engage (Unity) at startup: it calls MemoryPoolMap on "the pool the texture / buffer lives in", and with a stub returning 0 it dereferenced a null pool and crashed
-NVN(nvnTextureGetLevels, int, const NVNtexture *t) { return (int)CTX(t)->d.levels; }
-NVN(nvnTextureGetSparseTileLayout, void, const NVNtexture *t, NVNtextureSparseTileLayout *o) { sparse_layout(&CTX(t)->d, o); }
-NVN(nvnTextureGetSamples, int, const NVNtexture *t) { return CTX(t)->d.samples; }
-NVN(nvnTextureGetMemoryPool, NVNmemoryPool *, const NVNtexture *t) { return (NVNmemoryPool *)CTX(t)->pool; }
-NVN(nvnTextureGetMemoryOffset, ptrdiff_t, const NVNtexture *t) { return (ptrdiff_t)CTX(t)->off; }
+NVN(nvnTextureGetLevels, int, const NVNtexture *t) { return (t && CTX(t)->magic == MAGIC('T', 'E', 'X', 0)) ? (int)CTX(t)->d.levels : 1; }
+NVN(nvnTextureGetSparseTileLayout, void, const NVNtexture *t, NVNtextureSparseTileLayout *o) { if (t && CTX(t)->magic == MAGIC('T', 'E', 'X', 0)) sparse_layout(&CTX(t)->d, o); else memset(o, 0, sizeof *o); }
+NVN(nvnTextureGetSamples, int, const NVNtexture *t) { return (t && CTX(t)->magic == MAGIC('T', 'E', 'X', 0)) ? CTX(t)->d.samples : 1; }
+NVN(nvnTextureGetMemoryPool, NVNmemoryPool *, const NVNtexture *t) { return (t && CTX(t)->magic == MAGIC('T', 'E', 'X', 0)) ? (NVNmemoryPool *)CTX(t)->pool : NULL; }
+NVN(nvnTextureGetMemoryOffset, ptrdiff_t, const NVNtexture *t) { return (t && CTX(t)->magic == MAGIC('T', 'E', 'X', 0)) ? (ptrdiff_t)CTX(t)->off : 0; }
 // The GPU address of the texture's storage (DRAGON QUEST XI S, Unreal Engine 4.18, asks for it at start): pool address + offset, the same address space as nvnMemoryPoolGetBufferAddress
-NVN(nvnTextureGetTextureAddress, NVNtextureAddress, const NVNtexture *t) { const tex_t *o = CTX(t); if (o->pool) mtl_pool_addressed(o->pool->mem + o->off, o->L.size ? o->L.size : 1); return o->pool ? (NVNtextureAddress)(o->pool->mem + o->off) : 0; }
+NVN(nvnTextureGetTextureAddress, NVNtextureAddress, const NVNtexture *t) {
+    if (!t) return 0;
+    const tex_t *o = CTX(t);
+    if (o->magic != MAGIC('T', 'E', 'X', 0) || !o->pool || !o->pool->mem) return 0;
+    mtl_pool_addressed(o->pool->mem + o->off, o->L.size ? o->L.size : 1);
+    return (NVNtextureAddress)(o->pool->mem + o->off);
+}
 // The size of a texture's ZCull save area (SaveZCullData / RestoreZCullData). The host does no ZCull and never touches the area, but games allocate it from their own pools, and NVN
 // does not report 0. Cuphead (Unity 2017.4) allocates one per depth target (main+0x1948060) from its pool allocator, which gives a zero-size request the offset of a live block; its
 // map of allocations then loses that block (the zero-size one's size overwrites it, and freeing the zero-size one deletes it), and the block's own free later pushes a garbage-sized
@@ -2181,14 +2199,17 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (buf && BF(buf)->magic == MAGIC('B', 'U', 'F', 0) && BF(buf)->pool && BF(buf)->pool->mem) ? (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off) : 0; }
 // A buffer or pool the CPU has no access to (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) maps to NULL, as in NVN, though the host's storage is CPU memory: EA SPORTS FC 27's Frostbite
 // renderer takes a buffer's GPU address as GetAddress + (its data pointer − Map), with a null data pointer for such a buffer (OpcodeCopySubresource), so a real pointer made the
 // copy's destination address 0 (FATAL buffer copy address is in no memory pool)
-NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : BF(buf)->pool->mem + BF(buf)->off; }
-NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (size_t)BF(buf)->size; }
-NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (NVNmemoryPool *)BF(buf)->pool; }
-NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (ptrdiff_t)BF(buf)->off; }
+NVN(nvnBufferMap, void *, const NVNbuffer *buf) {
+    if (!buf || BF(buf)->magic != MAGIC('B', 'U', 'F', 0) || !BF(buf)->pool || !BF(buf)->pool->mem) return NULL;
+    return BF(buf)->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? NULL : BF(buf)->pool->mem + BF(buf)->off;
+}
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (buf && BF(buf)->magic == MAGIC('B', 'U', 'F', 0)) ? (size_t)BF(buf)->size : 0; }
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (buf && BF(buf)->magic == MAGIC('B', 'U', 'F', 0)) ? (NVNmemoryPool *)BF(buf)->pool : NULL; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (buf && BF(buf)->magic == MAGIC('B', 'U', 'F', 0)) ? (ptrdiff_t)BF(buf)->off : 0; }
 NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }        // unified memory: nothing to flush
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }
 
