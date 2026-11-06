@@ -687,6 +687,46 @@ static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Wind
 @end
 static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unretained
 
+@interface DmControllersMenuDelegate : NSObject <NSMenuDelegate>
+@end
+
+@implementation DmControllersMenuDelegate
+- (NSString *)formatBattery:(NSString *)name isLeft:(int)isLeft {
+    int chg = 0;
+    int lvl = dm_joycon_get_battery(isLeft, &chg);
+    if (lvl < 0) return [NSString stringWithFormat:@"%@: Not Connected", name];
+    const char *desc = "Full";
+    const char *icon = "🔋";
+    int pct = 100;
+    switch (lvl) {
+        case 0: desc = "Empty"; pct = 10; icon = "🪫"; break;
+        case 1: desc = "Critical"; pct = 25; icon = "🪫"; break;
+        case 2: desc = "Low"; pct = 50; icon = "🪫"; break;
+        case 3: desc = "Medium"; pct = 75; icon = "🔋"; break;
+        case 4: default: desc = "Full"; pct = 100; icon = "🔋"; break;
+    }
+    if (chg) {
+        return [NSString stringWithFormat:@"%@: ⚡️ %d%% (%s, Charging)", name, pct, desc];
+    } else {
+        return [NSString stringWithFormat:@"%@: %s %d%% (%s)", name, icon, pct, desc];
+    }
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+    NSMenuItem *itL = [menu addItemWithTitle:[self formatBattery:@"Joy-Con (L)" isLeft:1] action:nil keyEquivalent:@""];
+    itL.enabled = NO;
+    NSMenuItem *itR = [menu addItemWithTitle:[self formatBattery:@"Joy-Con (R)" isLeft:0] action:nil keyEquivalent:@""];
+    itR.enabled = NO;
+    if (dm_ringcon_active()) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *itRing = [menu addItemWithTitle:@"Ring-Con: Connected" action:nil keyEquivalent:@""];
+        itRing.enabled = NO;
+    }
+}
+@end
+static DmControllersMenuDelegate *g_ctrl_menu;
+
 @implementation DmCheatsPanel {
     NSPanel *_panel;              // created once in show, kept for the process's lifetime
     NSTextField *_header;         // the one-line status line above the rows
@@ -1371,6 +1411,12 @@ void front_run(void (*guest)(void)) {
         [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
         if (getenv("DM_CHEATS_WINDOW") && atoi(getenv("DM_CHEATS_WINDOW")))   // the Cheats panel open from the start (beside the game, not key)
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
+        g_ctrl_menu = [DmControllersMenuDelegate new];
+        NSMenu *ctm = [[NSMenu alloc] initWithTitle:@"Controllers"];
+        ctm.delegate = g_ctrl_menu;
+        ctm.autoenablesItems = NO;
+        [g_ctrl_menu menuNeedsUpdate:ctm];
+        [[bar addItemWithTitle:@"Controllers" action:nil keyEquivalent:@""] setSubmenu:ctm];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;

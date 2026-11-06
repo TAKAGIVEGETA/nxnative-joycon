@@ -1,5 +1,13 @@
 # nxnative
 
+> [!NOTE]
+> **Branch Highlight (`feat/joycon-support`):**  
+> This branch introduces dedicated, native Nintendo Switch Joy-Con and Ring-Con hardware support on macOS with high-precision 60 Hz motion controls, dual-controller synthesis (Player 1 Left + Right Joy-Cons), real-time battery level and charging status display (both in the built-in graphical launcher window and the in-game macOS menu bar, matching Eden's battery protocol), and real Ring-Con hidbus polling.
+>
+> **Featured Motion Games:**
+> - **[Ring Fit Adventure](dm/games/01002FF008C24000/README.md)** (`01002FF008C24000`): Fully playable on macOS with genuine physical Ring-Con push/pull strain-gauge force sensing and Joy-Con (L) leg-strap squat/motion tracking.
+> - **[Fit Boxing 3: Your Personal Trainer](dm/games/0100AC101BFA2000/README.md)** (`0100AC101BFA2000`): Fully playable on macOS with dual Joy-Con rhythm boxing workouts and responsive 6-axis motion tracking.
+
 Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.

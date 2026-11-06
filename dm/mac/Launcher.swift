@@ -7,15 +7,24 @@
 import AppKit
 import QuartzCore
 import SwiftUI
+import IOKit.hid
 
 private func info(_ key: String) -> String? { Bundle.main.object(forInfoDictionaryKey: key) as? String }
 
 struct LauncherView: View {
     @ObservedObject var m: LauncherModel
+    @ObservedObject var joyConMonitor: JoyConMonitor
     let done: (Bool) -> Void
     let fit: (CGFloat) -> Void
     @AppStorage("window.show") private var show = true
     @AppStorage("window.advanced") private var advanced = false
+
+    init(m: LauncherModel, joyConMonitor: JoyConMonitor = .shared, done: @escaping (Bool) -> Void, fit: @escaping (CGFloat) -> Void) {
+        self.m = m
+        self.joyConMonitor = joyConMonitor
+        self.done = done
+        self.fit = fit
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,6 +40,7 @@ struct LauncherView: View {
             Form {
                 settingSections(basic: true)
                 CloudSavesSection()
+                JoyConSection(monitor: joyConMonitor)
                 Section {
                     DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
                 }
@@ -118,19 +128,306 @@ struct CloudSavesSection: View {
     }
 }
 
+/// Battery badge modeled after Eden's controller preview: outline, terminal, fill level bar, and charging symbol
+struct JoyConBatteryBadge: View {
+    let level: Int
+    let charging: Bool
+    let connected: Bool
+
+    var percentage: Int {
+        switch level {
+        case 0: return 10
+        case 1: return 25
+        case 2: return 50
+        case 3: return 75
+        case 4: fallthrough
+        default: return 100
+        }
+    }
+
+    var levelDescription: String {
+        guard connected else { return "Not Connected" }
+        if charging { return "Charging" }
+        switch level {
+        case 0: return "Empty"
+        case 1: return "Critical"
+        case 2: return "Low"
+        case 3: return "Medium"
+        case 4: fallthrough
+        default: return "Full"
+        }
+    }
+
+    var fillColor: Color {
+        if charging { return .yellow }
+        switch level {
+        case 0, 1: return .red
+        case 2: return .orange
+        case 3, 4: fallthrough
+        default: return .green
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if connected {
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(Color.secondary.opacity(0.5), lineWidth: 1.5)
+                        .frame(width: 26, height: 13)
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(Color.secondary.opacity(0.5))
+                        .frame(width: 2, height: 5)
+                        .offset(x: 27)
+
+                    let fillWidth: CGFloat = {
+                        switch level {
+                        case 0: return 3
+                        case 1: return 6
+                        case 2: return 12
+                        case 3: return 18
+                        case 4: fallthrough
+                        default: return 23
+                        }
+                    }()
+
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(fillColor)
+                        .frame(width: max(0, fillWidth), height: 9)
+                        .padding(.leading, 1.5)
+
+                    if charging {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.primary)
+                            .offset(x: 8)
+                    }
+                }
+                .frame(width: 32, height: 14)
+
+                Text(charging ? "⚡️ \(percentage)% (\(levelDescription))" : "\(percentage)% (\(levelDescription))")
+                    .font(.callout)
+                    .foregroundStyle(level <= 1 ? .red : .primary)
+            } else {
+                Text("Not Connected")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct JoyConSection: View {
+    @ObservedObject var monitor: JoyConMonitor
+
+    var body: some View {
+        Section("Controllers") {
+            LabeledContent {
+                JoyConBatteryBadge(level: monitor.leftBatteryLevel, charging: monitor.leftCharging, connected: monitor.leftConnected)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "gamecontroller")
+                    Text("Joy-Con (L)")
+                }
+            }
+
+            LabeledContent {
+                JoyConBatteryBadge(level: monitor.rightBatteryLevel, charging: monitor.rightCharging, connected: monitor.rightConnected)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "gamecontroller")
+                    Text("Joy-Con (R)")
+                }
+            }
+        }
+    }
+}
+
+final class JoyConMonitor: ObservableObject {
+    static let shared = JoyConMonitor()
+
+    @Published var leftConnected = false
+    @Published var leftBatteryLevel: Int = -1
+    @Published var leftCharging = false
+
+    @Published var rightConnected = false
+    @Published var rightBatteryLevel: Int = -1
+    @Published var rightCharging = false
+
+    private var manager: IOHIDManager?
+    private var buffers: [IOHIDDevice: UnsafeMutablePointer<UInt8>] = [:]
+
+    func start() {
+        guard manager == nil else { return }
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.manager = mgr
+
+        let matches: [[String: Any]] = [
+            [kIOHIDVendorIDKey: 0x057E, kIOHIDProductIDKey: 0x2006],
+            [kIOHIDVendorIDKey: 0x057E, kIOHIDProductIDKey: 0x2007]
+        ]
+        IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, { ctx, result, sender, dev in
+            guard let ctx = ctx, result == kIOReturnSuccess else { return }
+            let monitor = Unmanaged<JoyConMonitor>.fromOpaque(ctx).takeUnretainedValue()
+            monitor.deviceMatched(dev)
+        }, context)
+
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, { ctx, result, sender, dev in
+            guard let ctx = ctx else { return }
+            let monitor = Unmanaged<JoyConMonitor>.fromOpaque(ctx).takeUnretainedValue()
+            monitor.deviceRemoved(dev)
+        }, context)
+
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        let ret = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        if ret != kIOReturnSuccess {
+            fputs("[RED] launcher: cannot open HID manager for Joy-Con monitoring (\(ret))\n", stderr)
+        }
+    }
+
+    func stop() {
+        guard let mgr = manager else { return }
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, nil, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, nil, nil)
+        IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        self.manager = nil
+
+        for (dev, buf) in buffers {
+            IOHIDDeviceRegisterInputReportCallback(dev, buf, 256, nil, nil)
+            buf.deallocate()
+        }
+        buffers.removeAll()
+    }
+
+    private func isLeftDevice(_ dev: IOHIDDevice) -> Bool {
+        let pid = (IOHIDDeviceGetProperty(dev, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
+        return pid == 0x2006
+    }
+
+    private func deviceMatched(_ dev: IOHIDDevice) {
+        let isLeft = isLeftDevice(dev)
+        DispatchQueue.main.async {
+            if isLeft { self.leftConnected = true }
+            else { self.rightConnected = true }
+        }
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 256)
+        buffers[dev] = buf
+
+        IOHIDDeviceRegisterInputReportCallback(dev, buf, 256, { ctx, result, sender, type, reportId, report, len in
+            guard let ctx = ctx, result == kIOReturnSuccess, len > 2 else { return }
+            let monitor = Unmanaged<JoyConMonitor>.fromOpaque(ctx).takeUnretainedValue()
+            let batt = report[2]
+            let charging = ((batt >> 4) & 1) != 0
+            let level = Int((batt >> 5) & 7)
+            monitor.reportReceived(batt: batt, charging: charging, level: level, sender: sender)
+        }, context)
+
+        var pkt: [UInt8] = [0x01, 0x00, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x02, 0x00]
+        IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(0x01), &pkt, pkt.count)
+    }
+
+    private func deviceRemoved(_ dev: IOHIDDevice) {
+        let isLeft = isLeftDevice(dev)
+        if let buf = buffers.removeValue(forKey: dev) {
+            IOHIDDeviceRegisterInputReportCallback(dev, buf, 256, nil, nil)
+            buf.deallocate()
+        }
+        DispatchQueue.main.async {
+            if isLeft {
+                self.leftConnected = false
+                self.leftBatteryLevel = -1
+                self.leftCharging = false
+            } else {
+                self.rightConnected = false
+                self.rightBatteryLevel = -1
+                self.rightCharging = false
+            }
+        }
+    }
+
+    private func reportReceived(batt: UInt8, charging: Bool, level: Int, sender: UnsafeMutableRawPointer?) {
+        guard let sender = sender else { return }
+        let dev = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
+        let isLeft = isLeftDevice(dev)
+        DispatchQueue.main.async {
+            if isLeft {
+                self.leftConnected = true
+                self.leftBatteryLevel = level
+                self.leftCharging = charging
+            } else {
+                self.rightConnected = true
+                self.rightBatteryLevel = level
+                self.rightCharging = charging
+            }
+        }
+    }
+}
+
+private final class JoyConMenuDelegate: NSObject, NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let m = JoyConMonitor.shared
+        func item(_ name: String, connected: Bool, level: Int, charging: Bool) -> NSMenuItem {
+            let title: String
+            if !connected {
+                title = "\(name): Not Connected"
+            } else {
+                let desc: String
+                let icon: String
+                let pct: Int
+                switch level {
+                case 0: desc = "Empty"; pct = 10; icon = "🪫"
+                case 1: desc = "Critical"; pct = 25; icon = "🪫"
+                case 2: desc = "Low"; pct = 50; icon = "🪫"
+                case 3: desc = "Medium"; pct = 75; icon = "🔋"
+                case 4: fallthrough
+                default: desc = "Full"; pct = 100; icon = "🔋"
+                }
+                if charging {
+                    title = "\(name): ⚡️ \(pct)% (\(desc), Charging)"
+                } else {
+                    title = "\(name): \(icon) \(pct)% (\(desc))"
+                }
+            }
+            let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            return it
+        }
+        menu.addItem(item("Joy-Con (L)", connected: m.leftConnected, level: m.leftBatteryLevel, charging: m.leftCharging))
+        menu.addItem(item("Joy-Con (R)", connected: m.rightConnected, level: m.rightBatteryLevel, charging: m.rightCharging))
+    }
+}
+
 private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model: LauncherModel
     var window: NSWindow?
     var play = false
+    private let joyConMenuDelegate = JoyConMenuDelegate()
 
     init(_ model: LauncherModel) { self.model = model }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        JoyConMonitor.shared.start()
         let name = info("CFBundleName") ?? "Game"
         let menu = NSMenu(), item = NSMenuItem(), app = NSMenu()
         app.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         app.addItem(withTitle: "Quit \(name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.submenu = app; menu.addItem(item); NSApp.mainMenu = menu
+        item.submenu = app; menu.addItem(item)
+        let ctrlItem = NSMenuItem(title: "Controllers", action: nil, keyEquivalent: "")
+        let ctrlMenu = NSMenu(title: "Controllers")
+        ctrlMenu.delegate = joyConMenuDelegate
+        ctrlMenu.autoenablesItems = false
+        joyConMenuDelegate.menuNeedsUpdate(ctrlMenu)
+        ctrlItem.submenu = ctrlMenu
+        menu.addItem(ctrlItem)
+        NSApp.mainMenu = menu
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.title = name; w.isReleasedWhenClosed = false; w.delegate = self
         w.contentMinSize = NSSize(width: 520, height: 0)
@@ -159,6 +456,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     func finish(_ play: Bool) {
+        JoyConMonitor.shared.stop()
         guard let w = window else { return }
         window = nil; self.play = play
         // The main thread blocks in launcher.c's waitpid once run() returns, so the window must leave the screen now: no fade-out (it runs on later run-loop passes),

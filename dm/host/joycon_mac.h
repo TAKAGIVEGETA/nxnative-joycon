@@ -63,6 +63,10 @@ static _Atomic uint64_t g_jc_left_buttons, g_jc_right_buttons;
 static _Atomic int32_t g_jc_left_lx, g_jc_left_ly, g_jc_right_rx, g_jc_right_ry;
 static _Atomic int g_ringcon_wanted, g_jc_ring_connected;
 static _Atomic uint32_t g_jc_ring_force_bits;
+static _Atomic int g_jc_left_battery = -1;
+static _Atomic int g_jc_left_charging = 0;
+static _Atomic int g_jc_right_battery = -1;
+static _Atomic int g_jc_right_charging = 0;
 
 static void joycon_retain(joycon_device *d) {
     atomic_fetch_add(&d->refs, 1);
@@ -101,6 +105,18 @@ int dm_joycon_count(void) {
 
 int dm_joycon_has_haptics(void) {
     return atomic_load(&g_joycon_left_connected) || atomic_load(&g_joycon_right_connected);
+}
+
+int dm_joycon_get_battery(int is_left, int *charging) {
+    if (is_left) {
+        if (!atomic_load(&g_joycon_left_connected)) return -1;
+        if (charging) *charging = atomic_load(&g_jc_left_charging);
+        return atomic_load(&g_jc_left_battery);
+    } else {
+        if (!atomic_load(&g_joycon_right_connected)) return -1;
+        if (charging) *charging = atomic_load(&g_jc_right_charging);
+        return atomic_load(&g_jc_right_battery);
+    }
 }
 
 static inline uint16_t jc_encode_hf(float freq) {
@@ -630,6 +646,17 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         pthread_mutex_unlock(&d->subcmd_lock);
     }
 
+    uint8_t batt = r[2];
+    int batt_chg = (batt >> 4) & 1;
+    int batt_lvl = (batt >> 5) & 7;
+    if (d->is_left) {
+        atomic_store(&g_jc_left_battery, batt_lvl);
+        atomic_store(&g_jc_left_charging, batt_chg);
+    } else {
+        atomic_store(&g_jc_right_battery, batt_lvl);
+        atomic_store(&g_jc_right_charging, batt_chg);
+    }
+
     uint64_t now = now_ns();
     int new_imu_pkt = 0;
     if (report_id == 0x30) {
@@ -850,6 +877,8 @@ static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
         atomic_store(&g_jc_left_buttons, 0);
         atomic_store(&g_jc_left_lx, 0);
         atomic_store(&g_jc_left_ly, 0);
+        atomic_store(&g_jc_left_battery, -1);
+        atomic_store(&g_jc_left_charging, 0);
         dm_motion_clear_hid_device(0, 0);
         LOG("[hid] Joy-Con (L) disconnected");
     } else {
@@ -857,6 +886,8 @@ static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
         atomic_store(&g_jc_right_buttons, 0);
         atomic_store(&g_jc_right_rx, 0);
         atomic_store(&g_jc_right_ry, 0);
+        atomic_store(&g_jc_right_battery, -1);
+        atomic_store(&g_jc_right_charging, 0);
         atomic_store(&g_jc_ring_connected, 0);
         atomic_store(&g_jc_ring_force_bits, 0);
         dm_motion_clear_hid_device(0, 1);
