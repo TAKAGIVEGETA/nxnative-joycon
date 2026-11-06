@@ -119,6 +119,11 @@ HLE_FORCE("_ZN2nn8irsensor30GetHandAnalysisSilhouetteStateEPNS0_27HandAnalysisSi
           void *s, int *n, int max, int64_t since, const void *h) { (void)s; (void)max; (void)since; (void)h; if (n) *n = 0; return RES_FAIL; }
 HLE_FORCE("_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferProcessorStateEPvmRKNS0_14IrCameraHandleE", "IR camera (cut)", Result, h_irs_ImageState,
           void *s, void *b, size_t n, const void *h) { (void)s; (void)b; (void)n; (void)h; return RES_FAIL; }
+// Ring Fit Adventure (SDK 9.3.0): checks whether the IR camera needs a firmware update and polls TeraPluginProcessor states for heart-rate measurement
+HLE_FORCE("_ZN2nn8irsensor28CheckFirmwareUpdateNecessityEPbRKNS0_14IrCameraHandleE", "IR camera (cut): no firmware update needed", Result, h_irs_CheckFw,
+          uint8_t *out, const void *h) { (void)h; if (out) *out = 0; return RES_OK; }
+HLE_FORCE("_ZN2nn8irsensor28GetTeraPluginProcessorStatesEPNS0_24TeraPluginProcessorStateEPiiljiRKNS0_14IrCameraHandleE", "IR camera TeraPluginProcessor (cut): 0 states", Result, h_irs_TeraStates,
+          void *s, int *n, int max, int64_t a, uint32_t b, int c, const void *h) { (void)s; (void)max; (void)a; (void)b; (void)c; (void)h; if (n) *n = 0; return RES_FAIL; }
 
 // ---------- ssl: offline, creating a context fails ----------
 HLE_FORCE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", "SSL (cut)", Result, h_ssl_ImpCli, void *self, uint64_t *id, const char *a, const char *b, unsigned x, unsigned y) { (void)self; (void)a; (void)b; (void)x; (void)y; if (id) *id = 0; return RES_FAIL; }
@@ -187,6 +192,16 @@ HLE_FORCE("_ZN2nn3web13ShowLobbyPageEPNS0_20LobbyPageReturnValueERKNS0_16ShowLob
 // Tears of the Kingdom imports the general web page applet too (the game constructs the return value itself, so it stays as constructed)
 HLE_FORCE("_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPageArgE", "web page applet (cut)", Result, h_web_Page, void *rv, const void *arg) { (void)rv; (void)arg; LOG("web::ShowWebPage (cut)"); return RES_FAIL; }
 // Octopath Traveler 0 imports the offline HTML page applet too (pages shipped in the game's HTML document NCA, which the host does not extract)
+// ---------- notification: exercise alarm settings (notif:a, Ring Fit Adventure) ----------
+HLE_FORCE("_ZN2nn12notification17ListAlarmSettingsEPNS0_12AlarmSettingEi", "alarm settings list (notif:a): 0 alarms", int, h_notif_ListAlarms, void *out, int max) { (void)out; (void)max; return 0; }
+HLE_FORCE("_ZN2nn12notification18DeleteAlarmSettingENS0_14AlarmSettingIdE", "alarm setting delete (notif:a): no-op", void, h_notif_DelAlarm, uint16_t id) { (void)id; }
+HLE_FORCE("_ZN2nn12notification18UpdateAlarmSettingERKNS0_12AlarmSettingEPKvm", "alarm setting update (notif:a): no-op", void, h_notif_UpdAlarm, const void *setting, const void *param, size_t sz) { (void)setting; (void)param; (void)sz; }
+HLE_FORCE("_ZN2nn12notification20RegisterAlarmSettingEPNS0_14AlarmSettingIdERKNS0_12AlarmSettingEPKvm", "alarm setting register (notif:a): reports success", unsigned, h_notif_RegAlarm,
+          uint16_t *out_id, const void *setting, const void *param, size_t sz) { (void)setting; (void)param; (void)sz; if (out_id) *out_id = 0; return 1; }
+HLE_FORCE("_ZN2nn12notification24LoadApplicationParameterEPvmNS0_14AlarmSettingIdE", "alarm setting parameter load (notif:a): 0 bytes", size_t, h_notif_LoadParam, void *out, size_t sz, uint16_t id) { (void)out; (void)sz; (void)id; return 0; }
+HLE_FORCE("_ZN2nn12notification33WeeklyScheduleAlarmSettingBuilder6SetUidENS_7account3UidE", "alarm builder set UID", void, h_notif_SetUid, uint8_t *self, uint64_t u0, uint64_t u1) {
+    if (self) { memcpy(self + 8, &u0, 8); memcpy(self + 16, &u1, 8); }
+}
 
 // ---------- C interface (nnsocket* / nnssl*): offline as well. The arguments are all in registers and the host does not look at them ----------
 HLE_FORCE("nnsocketAccept", "offline (cut)", int, h_c_sk_Accept, void) { return -1; }

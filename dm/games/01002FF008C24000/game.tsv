@@ -1,0 +1,37 @@
+# Ring Fit Adventure, SDK 9.3.0 (Nintendo EPD sead / agl / gsys)
+
+# ---- Identity ----
+title_id	01002FF008C24000
+program_id	01002FF008C24000
+
+# ---- App ----
+name	Ring Fit Adventure
+ipa	RingFitAdventure.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v327680	1.2.0	main=b0a94a27a8ea158cf81fc9b83e9366e6	subsdk0=7040311f0662e3519cf01fdaca364112	sdk=230994acc1eb0f13878dd155361beff3
+package	v327680
+shader_versions	v327680
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Movie/Staffroll.webm
+zip_store	.bwav:.pack:.szs:.webm:.xtx:.zs:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/Model/=model /TerrainArc/=terrainarc /Sound/=sound /Layout/=layout /AnimationSequence/=animationsequenc /Map/=map /Message/=message /Env/=env /Rumble/=rumble /Pack/=pack /Font/=font /System/=system /EventFlow/=eventflow /Movie/=movie /Shader/=shader /ELink2/=elink2 /Effect/=effect /SLink2/=slink2 /Voice/=voice
+shader_note	Ring Fit Adventure shaders
+
+# ---- Graphics ----
+render_cond	on

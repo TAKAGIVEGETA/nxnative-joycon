@@ -77,16 +77,23 @@ static inline void motion_update(motion_state *s, const motion_map *m, const flo
             float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
             if (n > 0.5f && n < 1.5f) {
                 // world down (0,0,-1) = R g_body  ->  R's third row = -g_body / |g|
-                float z[3] = {-a[0] / n, -a[1] / n, -a[2] / n}, y0[3] = {0, 1, 0};
-                // Upright phones have gravity along y: choose another heading reference before projecting it onto the level plane.
-                if (fabsf(z[1]) > 0.99f) { y0[0] = 1; y0[1] = 0; }
-                float d = y0[0] * z[0] + y0[1] * z[1] + y0[2] * z[2];
-                float y[3] = {y0[0] - d * z[0], y0[1] - d * z[1], y0[2] - d * z[2]};
-                float yn = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
-                if (yn > 1e-3f) {
-                    for (int i = 0; i < 3; i++) y[i] /= yn;
-                    float x[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2], y[0] * z[1] - y[1] * z[0]};
-                    for (int j = 0; j < 3; j++) { s->R[0][j] = x[j]; s->R[1][j] = y[j]; s->R[2][j] = z[j]; }
+                // Shortest-arc rotation from (0,0,1) to z avoids any heading singularity or 180-degree flip when upright (z[1] ≈ ±1).
+                float z[3] = {-a[0] / n, -a[1] / n, -a[2] / n};
+                if (z[2] > -0.99999f) {
+                    float k0 = 1.0f / (1.0f + z[2]);
+                    s->R[0][0] = 1.0f - z[0] * z[0] * k0;
+                    s->R[0][1] = -z[0] * z[1] * k0;
+                    s->R[0][2] = -z[0];
+                    s->R[1][0] = -z[0] * z[1] * k0;
+                    s->R[1][1] = 1.0f - z[1] * z[1] * k0;
+                    s->R[1][2] = -z[1];
+                    s->R[2][0] = z[0];
+                    s->R[2][1] = z[1];
+                    s->R[2][2] = z[2];
+                } else {
+                    s->R[0][0] = 1.0f; s->R[0][1] = 0.0f;  s->R[0][2] = 0.0f;
+                    s->R[1][0] = 0.0f; s->R[1][1] = -1.0f; s->R[1][2] = 0.0f;
+                    s->R[2][0] = 0.0f; s->R[2][1] = 0.0f;  s->R[2][2] = -1.0f;
                 }
             }
             s->primed = 1;
@@ -95,9 +102,11 @@ static inline void motion_update(motion_state *s, const motion_map *m, const flo
         // tilt correction: predicted gravity in the body = R^T (0,0,-1) = -(third row of R)
         float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
         if (k > 0 && n > 0.8f && n < 1.2f) {
+            float w2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            float eff_k = (w2 < 0.002f && n > 0.9f && n < 1.1f && k < 4.0f) ? 4.0f : k;
             float gm[3] = {a[0] / n, a[1] / n, a[2] / n}, gp[3] = {-s->R[2][0], -s->R[2][1], -s->R[2][2]};
             float e[3] = {gm[1] * gp[2] - gm[2] * gp[1], gm[2] * gp[0] - gm[0] * gp[2], gm[0] * gp[1] - gm[1] * gp[0]};
-            for (int i = 0; i < 3; i++) w[i] += k * e[i];
+            for (int i = 0; i < 3; i++) w[i] += eff_k * e[i];
         }
         float th = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * dt;
         if (isfinite(th) && th > 1e-9f) {

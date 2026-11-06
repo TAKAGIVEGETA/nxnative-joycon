@@ -17,6 +17,39 @@ typedef struct joycon_device {
     uint8_t report[512];
     uint8_t rumble_counter;
     int was_rumbling;
+    int stop_sends;
+    uint8_t last_rumble_enc[4];
+    pthread_mutex_t hid_write_lock;
+    pthread_mutex_t rumble_lock;
+    pthread_cond_t rumble_cv;
+    dm_vibration rumble_target;
+    float rumble_acc_lo;
+    float rumble_acc_hi;
+    int rumble_samples;
+    int rumble_dirty;
+    _Atomic int refs;
+    _Atomic int removed;
+    _Atomic int ring_connected;
+    _Atomic int ring_probing;
+    _Atomic int init_done;
+    int16_t ring_center;
+    int16_t ring_min;
+    int16_t ring_max;
+    int ring_log_bucket;
+    int16_t acc_offset[3];
+    int16_t acc_scale[3];
+    int16_t gyr_offset[3];
+    int16_t gyr_scale[3];
+    float gyro_bias[3];
+    uint8_t last_pkt_id;
+    int has_pkt_id;
+    uint64_t imu_ns;
+    pthread_mutex_t subcmd_lock;
+    pthread_cond_t subcmd_cv;
+    uint32_t subcmd_seq;
+    uint8_t last_subcmd_ack;
+    uint8_t last_subcmd_id;
+    uint8_t last_subcmd_data[34];
     struct joycon_device *next;
 } joycon_device;
 
@@ -28,6 +61,35 @@ static joycon_device *g_jc_right_dev = NULL;
 static _Atomic int g_joycon_left_connected, g_joycon_right_connected;
 static _Atomic uint64_t g_jc_left_buttons, g_jc_right_buttons;
 static _Atomic int32_t g_jc_left_lx, g_jc_left_ly, g_jc_right_rx, g_jc_right_ry;
+static _Atomic int g_ringcon_wanted, g_jc_ring_connected;
+static _Atomic uint32_t g_jc_ring_force_bits;
+
+static void joycon_retain(joycon_device *d) {
+    atomic_fetch_add(&d->refs, 1);
+}
+
+static void joycon_release(joycon_device *d) {
+    if (atomic_fetch_sub(&d->refs, 1) == 1) {
+        if (d->hid) CFRelease(d->hid);
+        pthread_mutex_destroy(&d->hid_write_lock);
+        pthread_mutex_destroy(&d->rumble_lock);
+        pthread_cond_destroy(&d->rumble_cv);
+        pthread_mutex_destroy(&d->subcmd_lock);
+        pthread_cond_destroy(&d->subcmd_cv);
+        free(d);
+    }
+}
+
+int dm_ringcon_active(void) {
+    return atomic_load(&g_jc_ring_connected);
+}
+
+float dm_ringcon_force(void) {
+    uint32_t bits = atomic_load(&g_jc_ring_force_bits);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 int dm_joycon_is_dual(void) {
     return atomic_load(&g_joycon_left_connected) && atomic_load(&g_joycon_right_connected);
@@ -139,48 +201,113 @@ static void joycon_encode_vibration(const dm_vibration *v, uint8_t out[4]) {
     out[3] = (uint8_t)(enc_lf_amp & 0xFF);
 }
 
-static void joycon_send_rumble(joycon_device *d, const dm_vibration *v) {
-    if (!d || !d->hid) return;
-    uint8_t enc[4];
-    joycon_encode_vibration(v, enc);
+static void *joycon_rumble_thread(void *arg) {
+    joycon_device *d = arg;
+    while (!atomic_load(&d->removed)) {
+        pthread_mutex_lock(&d->rumble_lock);
+        while (!d->rumble_dirty && !d->was_rumbling && d->stop_sends >= 2 && !atomic_load(&d->removed)) {
+            pthread_cond_wait(&d->rumble_cv, &d->rumble_lock);
+        }
+        if (atomic_load(&d->removed)) {
+            pthread_mutex_unlock(&d->rumble_lock);
+            break;
+        }
+        dm_vibration v = d->rumble_target;
+        if (d->rumble_samples > 0) {
+            // Average amplitude over the 35 ms Bluetooth transmission window so brief 5 ms
+            // LRA impulses do not get held at peak amplitude for 35 ms.
+            float avg_lo = d->rumble_acc_lo / (float)d->rumble_samples;
+            float avg_hi = d->rumble_acc_hi / (float)d->rumble_samples;
+            if (v.amplitude_low > 0.0f || v.amplitude_high > 0.0f) {
+                v.amplitude_low  = fminf(avg_lo * 0.35f, 0.40f);
+                v.amplitude_high = fminf(avg_hi * 0.35f, 0.40f);
+            }
+        }
+        d->rumble_acc_lo = 0.0f;
+        d->rumble_acc_hi = 0.0f;
+        d->rumble_samples = 0;
+        d->rumble_dirty = 0;
+        pthread_mutex_unlock(&d->rumble_lock);
 
-    int is_neutral = (enc[0] == 0x00 && enc[1] == 0x01 && enc[2] == 0x40 && enc[3] == 0x40);
-    if (is_neutral && !d->was_rumbling) return;
+        if (!atomic_load(&d->ring_probing) && d->hid) {
+            uint8_t enc[4];
+            joycon_encode_vibration(&v, enc);
+            int is_neutral = (enc[0] == 0x00 && enc[1] == 0x01 && enc[2] == 0x40 && enc[3] == 0x40);
 
-    uint8_t pkt[10];
-    pkt[0] = 0x10; // Report 0x10: Rumble Only
-    d->rumble_counter = (d->rumble_counter + 1) & 0x0F;
-    pkt[1] = d->rumble_counter;
-    memcpy(pkt + 2, enc, 4);
-    memcpy(pkt + 6, enc, 4);
+            int should_send = 0;
+            if (is_neutral) {
+                if (d->was_rumbling || d->stop_sends < 2) should_send = 1;
+            } else {
+                if (!d->was_rumbling || memcmp(enc, d->last_rumble_enc, 4) != 0) should_send = 1;
+            }
 
-    IOReturn ret = IOHIDDeviceSetReport(d->hid, kIOHIDReportTypeOutput, 0x10, pkt, sizeof(pkt));
-    if (ret == kIOReturnSuccess) {
-        d->was_rumbling = !is_neutral;
+            if (should_send) {
+                uint8_t pkt[10];
+                pkt[0] = 0x10; // Report 0x10: Rumble Only
+                d->rumble_counter = (d->rumble_counter + 1) & 0x0F;
+                pkt[1] = d->rumble_counter;
+                memcpy(pkt + 2, enc, 4);
+                memcpy(pkt + 6, enc, 4);
+
+                pthread_mutex_lock(&d->hid_write_lock);
+                IOReturn ret = IOHIDDeviceSetReport(d->hid, kIOHIDReportTypeOutput, 0x10, pkt, sizeof(pkt));
+                pthread_mutex_unlock(&d->hid_write_lock);
+
+                if (ret == kIOReturnSuccess) {
+                    memcpy(d->last_rumble_enc, enc, 4);
+                    if (is_neutral) {
+                        d->was_rumbling = 0;
+                        d->stop_sends++;
+                    } else {
+                        d->was_rumbling = 1;
+                        d->stop_sends = 0;
+                    }
+                }
+            }
+        }
+
+        // Pace Bluetooth HID Control Channel SET_REPORT transactions at ~28 Hz (35 ms)
+        // so IOBluetoothHIDDriver never collides and enters its 5-10s transaction timeout.
+        usleep(35000);
     }
+    joycon_release(d);
+    return NULL;
+}
+
+static void joycon_queue_rumble(joycon_device *d, const dm_vibration *v) {
+    if (!d || atomic_load(&d->removed)) return;
+    pthread_mutex_lock(&d->rumble_lock);
+    d->rumble_target = *v;
+    d->rumble_acc_lo += v->amplitude_low;
+    d->rumble_acc_hi += v->amplitude_high;
+    d->rumble_samples++;
+    d->rumble_dirty = 1;
+    pthread_cond_signal(&d->rumble_cv);
+    pthread_mutex_unlock(&d->rumble_lock);
 }
 
 void dm_joycon_apply_haptics(dm_haptic_state s) {
     if (s.player != 0) return;
     pthread_mutex_lock(&g_joycon_dev_lock);
     if (g_jc_left_dev && g_jc_right_dev) {
-        joycon_send_rumble(g_jc_left_dev, &s.motor[0]);
-        joycon_send_rumble(g_jc_right_dev, &s.motor[1]);
+        joycon_queue_rumble(g_jc_left_dev, &s.motor[0]);
+        joycon_queue_rumble(g_jc_right_dev, &s.motor[1]);
     } else if (g_jc_left_dev) {
         const dm_vibration *v = (s.motor[0].amplitude_high > 0 || s.motor[0].amplitude_low > 0) ? &s.motor[0] : &s.motor[1];
-        joycon_send_rumble(g_jc_left_dev, v);
+        joycon_queue_rumble(g_jc_left_dev, v);
     } else if (g_jc_right_dev) {
         const dm_vibration *v = (s.motor[1].amplitude_high > 0 || s.motor[1].amplitude_low > 0) ? &s.motor[1] : &s.motor[0];
-        joycon_send_rumble(g_jc_right_dev, v);
+        joycon_queue_rumble(g_jc_right_dev, v);
     }
     pthread_mutex_unlock(&g_joycon_dev_lock);
 }
 
-static void joycon_send_subcmd(IOHIDDeviceRef dev, uint8_t subcmd, const uint8_t *data, size_t len) {
+static void joycon_send_subcmd(joycon_device *d, uint8_t subcmd, const uint8_t *data, size_t len) {
+    if (!d || !d->hid) return;
     uint8_t buf[49] = {0};
     buf[0] = 0x01; // Output report 0x01
-    static uint8_t counter = 0;
-    buf[1] = (counter++) & 0x0F;
+    static _Atomic uint8_t counter = 0;
+    buf[1] = atomic_fetch_add(&counter, 1) & 0x0F;
     // Neutral rumble
     buf[2] = 0x00; buf[3] = 0x01; buf[4] = 0x40; buf[5] = 0x40;
     buf[6] = 0x00; buf[7] = 0x01; buf[8] = 0x40; buf[9] = 0x40;
@@ -188,7 +315,246 @@ static void joycon_send_subcmd(IOHIDDeviceRef dev, uint8_t subcmd, const uint8_t
     if (data && len > 0) {
         memcpy(buf + 11, data, len > 38 ? 38 : len);
     }
-    IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0x01, buf, sizeof(buf));
+    pthread_mutex_lock(&d->hid_write_lock);
+    IOHIDDeviceSetReport(d->hid, kIOHIDReportTypeOutput, 0x01, buf, sizeof(buf));
+    pthread_mutex_unlock(&d->hid_write_lock);
+}
+
+// CRC-8-CCITT (polynomial 0x07) used by Joy-Con MCU configuration packets (Subcommand 0x21)
+static uint8_t jc_mcu_crc8(const uint8_t *buf, size_t len) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static int joycon_send_subcmd_sync(joycon_device *d, uint8_t subcmd, const uint8_t *data, size_t len, uint8_t reply_out[34], int max_tries) {
+    for (int t = 0; t < max_tries && !atomic_load(&d->removed); t++) {
+        pthread_mutex_lock(&d->subcmd_lock);
+        uint32_t seq = d->subcmd_seq;
+        pthread_mutex_unlock(&d->subcmd_lock);
+
+        joycon_send_subcmd(d, subcmd, data, len);
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 66000000; // 66 ms timeout per attempt (matching Eden's GetSubCommandResponse)
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+
+        pthread_mutex_lock(&d->subcmd_lock);
+        while (!atomic_load(&d->removed) && (d->subcmd_seq == seq || d->last_subcmd_id != subcmd)) {
+            if (pthread_cond_timedwait(&d->subcmd_cv, &d->subcmd_lock, &ts) == ETIMEDOUT) break;
+        }
+        int ok = !atomic_load(&d->removed) && d->subcmd_seq != seq && d->last_subcmd_id == subcmd;
+        if (ok && reply_out) memcpy(reply_out, d->last_subcmd_data, 34);
+        pthread_mutex_unlock(&d->subcmd_lock);
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+static int joycon_read_spi(joycon_device *d, uint16_t addr, uint8_t size, uint8_t *out) {
+    if (size > 29) return 0;
+    uint8_t req[5] = {(uint8_t)(addr & 0xFF), (uint8_t)((addr >> 8) & 0xFF), 0x00, 0x00, size};
+    for (int tries = 0; tries < 5 && !atomic_load(&d->removed); tries++) {
+        uint8_t reply[34] = {0};
+        if (joycon_send_subcmd_sync(d, 0x10, req, sizeof(req), reply, 4)) {
+            uint16_t r_addr = (uint16_t)reply[0] | ((uint16_t)reply[1] << 8);
+            if (r_addr == addr && reply[4] == size) {
+                memcpy(out, reply + 5, size);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static inline int16_t jc_validate_cal(int16_t val, int16_t def) {
+    if (val == 0 || val == 0x0FFF || val == -1) return def;
+    return val;
+}
+
+static void joycon_load_imu_calibration(joycon_device *d) {
+    uint8_t magic[2] = {0};
+    uint8_t cal[24] = {0};
+    int is_user = 0;
+    if (joycon_read_spi(d, 0x8026, 2, magic) && magic[0] == 0xB2 && magic[1] == 0xA1) {
+        if (joycon_read_spi(d, 0x8028, 24, cal)) is_user = 1;
+    }
+    if (!is_user && !joycon_read_spi(d, 0x6020, 24, cal)) return;
+
+    int16_t v[12];
+    for (int i = 0; i < 12; i++) {
+        v[i] = (int16_t)((uint16_t)cal[2 * i] | ((uint16_t)cal[2 * i + 1] << 8));
+    }
+    for (int i = 0; i < 3; i++) {
+        int16_t ao = jc_validate_cal(v[0 + i], 0);
+        int16_t as = jc_validate_cal(v[3 + i], 0x4000);
+        int16_t go = jc_validate_cal(v[6 + i], 0);
+        int16_t gs = jc_validate_cal(v[9 + i], 0x3be7);
+        if ((int32_t)as - (int32_t)ao > 2000) {
+            d->acc_offset[i] = ao;
+            d->acc_scale[i] = as;
+        }
+        if ((int32_t)gs - (int32_t)go > 2000) {
+            d->gyr_offset[i] = go;
+            d->gyr_scale[i] = gs;
+        }
+    }
+    LOG("[hid] Joy-Con (%s) IMU %s calibration: acc_off=(%d,%d,%d) acc_scale=(%d,%d,%d) gyr_off=(%d,%d,%d) gyr_scale=(%d,%d,%d)",
+        d->is_left ? "L" : "R", is_user ? "user" : "factory",
+        d->acc_offset[0], d->acc_offset[1], d->acc_offset[2],
+        d->acc_scale[0], d->acc_scale[1], d->acc_scale[2],
+        d->gyr_offset[0], d->gyr_offset[1], d->gyr_offset[2],
+        d->gyr_scale[0], d->gyr_scale[1], d->gyr_scale[2]);
+}
+
+static void joycon_maybe_start_ringcon(joycon_device *d);
+
+static void *joycon_init_thread(void *arg) {
+    joycon_device *d = arg;
+    atomic_store(&d->ring_probing, 1);
+
+    // 1. Read SPI flash IMU calibration (user 0x8026/0x8028 or factory 0x6020)
+    joycon_load_imu_calibration(d);
+
+    // 2. Enable 6-axis IMU (ENABLE_IMU = 0x40, arg = 0x01)
+    uint8_t imu_on = 0x01;
+    joycon_send_subcmd_sync(d, 0x40, &imu_on, 1, NULL, 4);
+
+    // 3. Set IMU sensitivity to DPS2000, G8, HZ833, HZ100 (SET_IMU_SENSITIVITY = 0x41)
+    static const uint8_t imu_cfg[4] = {0x03, 0x00, 0x00, 0x01};
+    joycon_send_subcmd_sync(d, 0x41, imu_cfg, sizeof(imu_cfg), NULL, 4);
+
+    // 4. Enable vibration (ENABLE_VIBRATION = 0x48, arg = 0x01)
+    uint8_t vib_on = 0x01;
+    joycon_send_subcmd_sync(d, 0x48, &vib_on, 1, NULL, 4);
+
+    // 5. Set player 1 LED pattern solid (SET_PLAYER_LIGHTS = 0x30, arg = 0x01)
+    uint8_t led_p1 = 0x01;
+    joycon_send_subcmd_sync(d, 0x30, &led_p1, 1, NULL, 4);
+
+    // 6. Set report mode to 0x30 standard full 60Hz report (SET_REPORT_MODE = 0x03)
+    uint8_t mode_30 = 0x30;
+    joycon_send_subcmd_sync(d, 0x03, &mode_30, 1, NULL, 6);
+
+    // Reset motion state so it primes cleanly with the calibrated IMU stream
+    d->imu_ns = 0;
+    dm_motion_clear_hid_device(0, d->is_left ? 0 : 1);
+
+    atomic_store(&d->init_done, 1);
+    atomic_store(&d->ring_probing, 0);
+
+    if (!d->is_left && atomic_load(&g_ringcon_wanted)) {
+        joycon_maybe_start_ringcon(d);
+    }
+
+    joycon_release(d);
+    return NULL;
+}
+
+static void *ringcon_init_thread(void *arg) {
+    joycon_device *d = arg;
+    while (!atomic_load(&d->removed) && atomic_load(&g_ringcon_wanted) && !atomic_load(&d->ring_connected)) {
+        atomic_store(&d->ring_probing, 1);
+
+        // 1. Ensure Report Mode 0x30 (SET_REPORT_MODE = 0x03)
+        uint8_t mode_30 = 0x30;
+        joycon_send_subcmd_sync(d, 0x03, &mode_30, 1, NULL, 6);
+
+        // 2. Enable MCU (SET_MCU_STATE = 0x22, arg = 0x01)
+        uint8_t mcu_on = 0x01;
+        joycon_send_subcmd_sync(d, 0x22, &mcu_on, 1, NULL, 6);
+
+        // 3. Configure MCU device mode to Standby (SET_MCU_CONFIG = 0x21)
+        uint8_t mcu_cfg[38] = {0};
+        mcu_cfg[0] = 0x21; // ConfigureMCU
+        mcu_cfg[1] = 0x01; // SetDeviceMode
+        mcu_cfg[2] = 0x01; // Standby
+        mcu_cfg[37] = jc_mcu_crc8(mcu_cfg + 1, 36);
+        joycon_send_subcmd_sync(d, 0x21, mcu_cfg, sizeof(mcu_cfg), NULL, 6);
+
+        // 4. Poll GET_EXTERNAL_DEVICE_INFO (0x59) for RingController (0x2000)
+        int found_ring = 0;
+        for (int tries = 0; tries < 42 && !atomic_load(&d->removed) && atomic_load(&g_ringcon_wanted); tries++) {
+            uint8_t reply[34] = {0};
+            if (joycon_send_subcmd_sync(d, 0x59, NULL, 0, reply, 3)) {
+                uint16_t ext_id = (uint16_t)reply[0] | ((uint16_t)reply[1] << 8);
+                if (ext_id == 0x2000) {
+                    found_ring = 1;
+                    break;
+                }
+            }
+            usleep(40000);
+        }
+
+        if (found_ring && !atomic_load(&d->removed) && atomic_load(&g_ringcon_wanted)) {
+            // 5. Configure Ring-Con external format (SET_EXTERNAL_CONFIG = 0x5C)
+            static const uint8_t ring_config[37] = {
+                0x06, 0x03, 0x25, 0x06, 0x00, 0x00, 0x00, 0x00, 0x1C, 0x16, 0xED, 0x34, 0x36,
+                0x00, 0x00, 0x00, 0x0A, 0x64, 0x0B, 0xE6, 0xA9, 0x22, 0x00, 0x00, 0x04, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0xA8, 0xE1, 0x34, 0x36
+            };
+            joycon_send_subcmd_sync(d, 0x5C, ring_config, sizeof(ring_config), NULL, 6);
+
+            // 6. Enable Ring-Con external polling (ENABLE_EXTERNAL_POLLING = 0x5A)
+            static const uint8_t ext_poll[4] = {0x04, 0x01, 0x01, 0x02};
+            if (joycon_send_subcmd_sync(d, 0x5A, ext_poll, sizeof(ext_poll), NULL, 6)) {
+                usleep(50000);
+                d->ring_center = 0;
+                d->ring_min = 0;
+                d->ring_max = 0;
+                d->ring_log_bucket = 0;
+                atomic_store(&d->ring_connected, 1);
+                atomic_store(&g_jc_ring_connected, 1);
+                atomic_store(&d->ring_probing, 0);
+                LOG("[hid] Ring-Con detected on Joy-Con (R) and external polling enabled");
+                break;
+            }
+        }
+
+        atomic_store(&d->ring_probing, 0);
+        for (int w = 0; w < 10 && !atomic_load(&d->removed) && atomic_load(&g_ringcon_wanted); w++) {
+            usleep(100000);
+        }
+    }
+    atomic_store(&d->ring_probing, 0);
+    joycon_release(d);
+    return NULL;
+}
+
+static void joycon_maybe_start_ringcon(joycon_device *d) {
+    if (!d || d->is_left || atomic_load(&d->removed) || atomic_load(&d->ring_connected)) return;
+    if (!atomic_load(&g_ringcon_wanted) || !atomic_load(&d->init_done)) return;
+    if (atomic_exchange(&d->ring_probing, 1)) return;
+    joycon_retain(d);
+    pthread_t th;
+    if (pthread_create(&th, NULL, ringcon_init_thread, d) == 0) {
+        pthread_detach(th);
+    } else {
+        atomic_store(&d->ring_probing, 0);
+        joycon_release(d);
+    }
+}
+
+void dm_ringcon_enable(int enable) {
+    int prev = atomic_exchange(&g_ringcon_wanted, enable ? 1 : 0);
+    if (!enable) {
+        atomic_store(&g_jc_ring_connected, 0);
+        atomic_store(&g_jc_ring_force_bits, 0);
+        return;
+    }
+    if (!prev) {
+        LOG("[hid] Ring-Con polling requested by game (hidbus enabled)");
+    }
+    pthread_mutex_lock(&g_joycon_dev_lock);
+    joycon_device *d = g_jc_right_dev;
+    if (d) joycon_maybe_start_ringcon(d);
+    pthread_mutex_unlock(&g_joycon_dev_lock);
 }
 
 static void joycon_publish_pad(void) {
@@ -198,14 +564,81 @@ static void joycon_publish_pad(void) {
     dm_pad_set_player(0, btn, lx, ly, rx, ry);
 }
 
+static void joycon_decode_imu(joycon_device *d, const uint8_t *b_imu, float acc_out[3], float rot_out[3]) {
+    int16_t v[6];
+    for (int i = 0; i < 6; i++) {
+        v[i] = (int16_t)((uint16_t)b_imu[2 * i] | ((uint16_t)b_imu[2 * i + 1] << 8));
+    }
+    // Match Eden's JoyconPoller::GetMotionInput (poller.cpp:313-372)
+    float ax = (float)v[1] * 4.0f / (float)(d->acc_scale[1] - d->acc_offset[1]);
+    float ay = (float)v[0] * 4.0f / (float)(d->acc_scale[0] - d->acc_offset[0]);
+    float az = (float)v[2] * 4.0f / (float)(d->acc_scale[2] - d->acc_offset[2]);
+
+    const float deg_to_rad = (float)M_PI / 180.0f;
+    float gx = (float)(v[4] - d->gyr_offset[1]) * (936.0f * deg_to_rad) / (float)(d->gyr_scale[1] - d->gyr_offset[1]);
+    float gy = (float)(v[3] - d->gyr_offset[0]) * (936.0f * deg_to_rad) / (float)(d->gyr_scale[0] - d->gyr_offset[0]);
+    float gz = (float)(v[5] - d->gyr_offset[2]) * (936.0f * deg_to_rad) / (float)(d->gyr_scale[2] - d->gyr_offset[2]);
+
+    if (d->is_left) {
+        acc_out[0] = ax;
+        acc_out[1] = -ay;
+        acc_out[2] = -az;
+        rot_out[0] = -gx;
+        rot_out[1] = gy;
+        rot_out[2] = gz;
+    } else {
+        acc_out[0] = -ax;
+        acc_out[1] = -ay;
+        acc_out[2] = az;
+        rot_out[0] = gx;
+        rot_out[1] = gy;
+        rot_out[2] = -gz;
+    }
+
+    // Match Eden's MotionInput::SetGyroscope (motion_input.cpp:37-59):
+    // subtract adaptive resting bias and apply resting deadzone (0.007 rev/s = 0.044 rad/s)
+    float raw_rot[3] = {rot_out[0], rot_out[1], rot_out[2]};
+    for (int i = 0; i < 3; i++) {
+        rot_out[i] = raw_rot[i] - d->gyro_bias[i];
+    }
+    float rot_len = sqrtf(rot_out[0] * rot_out[0] + rot_out[1] * rot_out[1] + rot_out[2] * rot_out[2]);
+    float acc_len = sqrtf(acc_out[0] * acc_out[0] + acc_out[1] * acc_out[1] + acc_out[2] * acc_out[2]);
+    if (rot_len < 0.942f && acc_len > 0.9f && acc_len < 1.1f) {
+        for (int i = 0; i < 3; i++) {
+            d->gyro_bias[i] = d->gyro_bias[i] * 0.9995f + raw_rot[i] * 0.0005f;
+        }
+    }
+    if (rot_len < 0.044f) {
+        rot_out[0] = 0.0f;
+        rot_out[1] = 0.0f;
+        rot_out[2] = 0.0f;
+    }
+}
+
 static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportType type, uint32_t report_id, uint8_t *r, CFIndex len) {
     (void)sender;
     joycon_device *d = ctx;
-    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || len < 49 || report_id != 0x30) return;
+    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || len < 49 || (report_id != 0x30 && report_id != 0x21)) return;
 
-    const float g = 1.0f / 4096.0f;
-    const float rad = 0.070f * (float)M_PI / 180.0f;
+    if (report_id == 0x21) {
+        pthread_mutex_lock(&d->subcmd_lock);
+        d->last_subcmd_ack = r[13];
+        d->last_subcmd_id = r[14];
+        memcpy(d->last_subcmd_data, r + 15, 34);
+        d->subcmd_seq++;
+        pthread_cond_broadcast(&d->subcmd_cv);
+        pthread_mutex_unlock(&d->subcmd_lock);
+    }
+
     uint64_t now = now_ns();
+    int new_imu_pkt = 0;
+    if (report_id == 0x30) {
+        if (!d->has_pkt_id || d->last_pkt_id != r[1]) {
+            d->has_pkt_id = 1;
+            d->last_pkt_id = r[1];
+            new_imu_pkt = 1;
+        }
+    }
 
     if (d->is_left) {
         // Buttons
@@ -214,6 +647,8 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         if (r[5] & 0x02) b |= DM_BTN_UP;
         if (r[5] & 0x04) b |= DM_BTN_RIGHT;
         if (r[5] & 0x08) b |= DM_BTN_LEFT;
+        if (r[5] & 0x10) b |= DM_BTN_LEFT_SR;
+        if (r[5] & 0x20) b |= DM_BTN_LEFT_SL;
         if (r[5] & 0x40) b |= DM_BTN_L;
         if (r[5] & 0x80) b |= DM_BTN_ZL;
         if (r[4] & 0x01) b |= DM_BTN_MINUS;
@@ -230,17 +665,18 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         atomic_store(&g_jc_left_lx, (int32_t)fminf(fmaxf((float)dx * 32767.f / 1600.f, -32767.f), 32767.f));
         atomic_store(&g_jc_left_ly, (int32_t)fminf(fmaxf((float)dy * 32767.f / 1600.f, -32767.f), 32767.f));
 
-        // 3 IMU frames (offset 13 + 12 * k)
-        for (int k = 0; k < 3; k++) {
-            const uint8_t *b_imu = r + 13 + 12 * k;
-            int16_t v[6];
-            for (int i = 0; i < 6; i++) {
-                v[i] = (int16_t)((uint16_t)b_imu[2 * i] | ((uint16_t)b_imu[2 * i + 1] << 8));
+        if (new_imu_pkt) {
+            uint64_t step_ns = 5000000;
+            if (!d->imu_ns || now < d->imu_ns || now - d->imu_ns > 60000000) {
+                d->imu_ns = now - 3 * step_ns;
             }
-            float acc[3] = { v[1] * g, -v[0] * g, -v[2] * g };
-            float rot[3] = { -v[4] * rad, v[3] * rad, v[5] * rad };
-            uint64_t ns = now - (uint64_t)(2 - k) * 5000000;
-            dm_motion_set_hid_device(0, 0, acc, rot, ns);
+            for (int k = 0; k < 3; k++) {
+                float acc[3], rot[3];
+                joycon_decode_imu(d, r + 13 + 12 * k, acc, rot);
+                d->imu_ns += step_ns;
+                if (d->imu_ns > now) d->imu_ns = now - (uint64_t)(2 - k) * 1000;
+                dm_motion_set_hid_device(0, 0, acc, rot, d->imu_ns);
+            }
         }
     } else {
         // Right Joy-Con
@@ -249,6 +685,8 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         if (r[3] & 0x02) b |= DM_BTN_X;
         if (r[3] & 0x04) b |= DM_BTN_B;
         if (r[3] & 0x08) b |= DM_BTN_A;
+        if (r[3] & 0x10) b |= DM_BTN_RIGHT_SR;
+        if (r[3] & 0x20) b |= DM_BTN_RIGHT_SL;
         if (r[3] & 0x40) b |= DM_BTN_R;
         if (r[3] & 0x80) b |= DM_BTN_ZR;
         if (r[4] & 0x02) b |= DM_BTN_PLUS;
@@ -265,17 +703,50 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         atomic_store(&g_jc_right_rx, (int32_t)fminf(fmaxf((float)dx * 32767.f / 1600.f, -32767.f), 32767.f));
         atomic_store(&g_jc_right_ry, (int32_t)fminf(fmaxf((float)dy * 32767.f / 1600.f, -32767.f), 32767.f));
 
-        // 3 IMU frames
-        for (int k = 0; k < 3; k++) {
-            const uint8_t *b_imu = r + 13 + 12 * k;
-            int16_t v[6];
-            for (int i = 0; i < 6; i++) {
-                v[i] = (int16_t)((uint16_t)b_imu[2 * i] | ((uint16_t)b_imu[2 * i + 1] << 8));
+        if (report_id == 0x30) {
+            int ring_on = atomic_load(&d->ring_connected);
+            if (new_imu_pkt) {
+                int imu_frames = ring_on ? 2 : 3;
+                uint64_t step_ns = ring_on ? 7500000 : 5000000;
+                if (!d->imu_ns || now < d->imu_ns || now - d->imu_ns > 60000000) {
+                    d->imu_ns = now - (uint64_t)imu_frames * step_ns;
+                }
+                for (int k = 0; k < imu_frames; k++) {
+                    float acc[3], rot[3];
+                    joycon_decode_imu(d, r + 13 + 12 * k, acc, rot);
+                    d->imu_ns += step_ns;
+                    if (d->imu_ns > now) d->imu_ns = now - (uint64_t)(imu_frames - 1 - k) * 1000;
+                    dm_motion_set_hid_device(0, 1, acc, rot, d->imu_ns);
+                }
             }
-            float acc[3] = { -v[1] * g, -v[0] * g, v[2] * g };
-            float rot[3] = { v[4] * rad, v[3] * rad, -v[5] * rad };
-            uint64_t ns = now - (uint64_t)(2 - k) * 5000000;
-            dm_motion_set_hid_device(0, 1, acc, rot, ns);
+            if (ring_on) {
+                int16_t raw_ring = (int16_t)((uint16_t)r[39] | ((uint16_t)r[40] << 8));
+                if (raw_ring > 500) {
+                    if (d->ring_center == 0) {
+                        d->ring_center = raw_ring;
+                        d->ring_min = (int16_t)(raw_ring - 800);
+                        d->ring_max = (int16_t)(raw_ring + 800);
+                        LOG("[hid] Ring-Con calibrated resting value: %d (initial range [%d, %d])", raw_ring, d->ring_min, d->ring_max);
+                    }
+                    if (raw_ring > d->ring_max) d->ring_max = raw_ring;
+                    if (raw_ring < d->ring_min) d->ring_min = raw_ring;
+                    float diff = (float)(raw_ring - d->ring_center);
+                    float force = 0.0f;
+                    if (diff > 0.0f && d->ring_max > d->ring_center) {
+                        force = diff / (float)(d->ring_max - d->ring_center);
+                    } else if (diff < 0.0f && d->ring_center > d->ring_min) {
+                        force = diff / (float)(d->ring_center - d->ring_min);
+                    }
+                    uint32_t bits;
+                    memcpy(&bits, &force, sizeof(bits));
+                    atomic_store(&g_jc_ring_force_bits, bits);
+                    int bucket = (int)(force * 5.0f);
+                    if (bucket != d->ring_log_bucket && (bucket <= -1 || bucket >= 1 || d->ring_log_bucket <= -1 || d->ring_log_bucket >= 1)) {
+                        d->ring_log_bucket = bucket;
+                        LOG("[hid] Ring-Con input: raw=%d center=%d force=%.2f", raw_ring, d->ring_center, force);
+                    }
+                }
+            }
         }
     }
     joycon_publish_pad();
@@ -294,6 +765,17 @@ static void joycon_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRe
     if (!d) return;
     d->hid = (IOHIDDeviceRef)CFRetain(hid);
     d->is_left = is_left;
+    d->stop_sends = 2;
+    for (int i = 0; i < 3; i++) {
+        d->acc_scale[i] = 0x4000;
+        d->gyr_scale[i] = 0x3be7;
+    }
+    atomic_store(&d->refs, 1);
+    pthread_mutex_init(&d->subcmd_lock, NULL);
+    pthread_cond_init(&d->subcmd_cv, NULL);
+    pthread_mutex_init(&d->hid_write_lock, NULL);
+    pthread_mutex_init(&d->rumble_lock, NULL);
+    pthread_cond_init(&d->rumble_cv, NULL);
     d->next = g_joycon_devices;
     g_joycon_devices = d;
 
@@ -310,25 +792,27 @@ static void joycon_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRe
 
     LOG("[hid] Joy-Con (%s) connected (PID 0x%04x)", is_left ? "L" : "R", pid);
 
-    // 1. Enable 6-axis IMU (subcmd 0x40, arg 0x01)
-    uint8_t imu_on = 0x01;
-    joycon_send_subcmd(hid, 0x40, &imu_on, 1);
-
-    // 2. Set report mode to 0x30 standard full report (subcmd 0x03, arg 0x30)
-    uint8_t mode_30 = 0x30;
-    joycon_send_subcmd(hid, 0x03, &mode_30, 1);
-
-    // 3. Set player 1 LED pattern solid (subcmd 0x30, arg 0x01)
-    uint8_t led_p1 = 0x01;
-    joycon_send_subcmd(hid, 0x30, &led_p1, 1);
-
-    // 4. Enable vibration (subcmd 0x48, arg 0x01)
-    uint8_t vib_on = 0x01;
-    joycon_send_subcmd(hid, 0x48, &vib_on, 1);
-
     dm_haptics_route(0, 1);
 
     IOHIDDeviceRegisterInputReportCallback(hid, d->report, sizeof d->report, joycon_report, d);
+
+    // Start dedicated per-Joy-Con Bluetooth rumble worker
+    atomic_fetch_add(&d->refs, 1);
+    pthread_t rthr;
+    if (pthread_create(&rthr, NULL, joycon_rumble_thread, d) == 0) {
+        pthread_detach(rthr);
+    } else {
+        joycon_release(d);
+    }
+
+    // Start synchronous initialization worker (reads SPI calibration, configures IMU & report 0x30, then probes Ring-Con on R)
+    joycon_retain(d);
+    pthread_t ithr;
+    if (pthread_create(&ithr, NULL, joycon_init_thread, d) == 0) {
+        pthread_detach(ithr);
+    } else {
+        joycon_release(d);
+    }
 }
 
 static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef hid) {
@@ -339,11 +823,21 @@ static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
     joycon_device *d = *link;
     *link = d->next;
 
+    atomic_store(&d->removed, 1);
+    pthread_mutex_lock(&d->subcmd_lock);
+    pthread_cond_broadcast(&d->subcmd_cv);
+    pthread_mutex_unlock(&d->subcmd_lock);
+    pthread_mutex_lock(&d->rumble_lock);
+    pthread_cond_broadcast(&d->rumble_cv);
+    pthread_mutex_unlock(&d->rumble_lock);
+
     IOHIDDeviceRegisterInputReportCallback(hid, d->report, sizeof d->report, NULL, NULL);
 
     if (d->was_rumbling) {
         uint8_t pkt[10] = {0x10, (uint8_t)((d->rumble_counter++) & 0x0F), 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
+        pthread_mutex_lock(&d->hid_write_lock);
         IOHIDDeviceSetReport(hid, kIOHIDReportTypeOutput, 0x10, pkt, sizeof(pkt));
+        pthread_mutex_unlock(&d->hid_write_lock);
     }
 
     pthread_mutex_lock(&g_joycon_dev_lock);
@@ -363,6 +857,8 @@ static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
         atomic_store(&g_jc_right_buttons, 0);
         atomic_store(&g_jc_right_rx, 0);
         atomic_store(&g_jc_right_ry, 0);
+        atomic_store(&g_jc_ring_connected, 0);
+        atomic_store(&g_jc_ring_force_bits, 0);
         dm_motion_clear_hid_device(0, 1);
         LOG("[hid] Joy-Con (R) disconnected");
     }
@@ -372,8 +868,7 @@ static void joycon_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
         dm_haptics_route(0, 0);
     }
 
-    CFRelease(d->hid);
-    free(d);
+    joycon_release(d);
 }
 
 static void dm_joycon_start(void) {

@@ -151,7 +151,7 @@ static void on_key(NSEvent *e, int down) {
     int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
     if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
     int b = key_bit(c);
-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
+    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : c == 30 ? DM_BTN_RING_SQUEEZE : c == 33 ? DM_BTN_RING_PULL : 0;   // Space: shaken; ] / [: Ring-Con squeeze / pull
     g_btn = down ? (g_btn | m) : (g_btn & ~m);
     if (down && (m || c == 13 || c == 0 || c == 1 || c == 2)) cursor_hide_for_input();   // a key the game takes (WASD: the left stick)
     push();

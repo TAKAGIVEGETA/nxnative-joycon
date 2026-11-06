@@ -8,8 +8,11 @@ enum {
     DM_BTN_LS = 1u << 4, DM_BTN_RS = 1u << 5, DM_BTN_L = 1u << 6, DM_BTN_R = 1u << 7,
     DM_BTN_ZL = 1u << 8, DM_BTN_ZR = 1u << 9, DM_BTN_PLUS = 1u << 10, DM_BTN_MINUS = 1u << 11,
     DM_BTN_LEFT = 1u << 12, DM_BTN_UP = 1u << 13, DM_BTN_RIGHT = 1u << 14, DM_BTN_DOWN = 1u << 15,
+    DM_BTN_LEFT_SL = 1u << 24, DM_BTN_LEFT_SR = 1u << 25, DM_BTN_RIGHT_SL = 1u << 26, DM_BTN_RIGHT_SR = 1u << 27,
 };
-#define DM_BTN_SHAKE (1ull << 63)   // not an NpadButton: the controller is shaken while set (its six-axis sensor, hle_hid.c); never reaches the game's buttons
+#define DM_BTN_RING_SQUEEZE (1ull << 61)   // not an NpadButton: Ring-Con squeezed inward while set (hle_hid.c)
+#define DM_BTN_RING_PULL    (1ull << 62)   // not an NpadButton: Ring-Con pulled outward while set (hle_hid.c)
+#define DM_BTN_SHAKE        (1ull << 63)   // not an NpadButton: the controller is shaken while set (its six-axis sensor, hle_hid.c); never reaches the game's buttons
 #define DM_STICK_MAX 32767
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
 uint64_t dm_input_samples(void);   // Cumulative number of times the game has sampled the controller
@@ -38,6 +41,9 @@ void dm_motion_clear_hid(int player);
 void dm_motion_clear_hid_device(int player, int device);
 int dm_joycon_is_dual(void);
 int dm_joycon_count(void);
+void dm_ringcon_enable(int enable);
+int dm_ringcon_active(void);
+float dm_ringcon_force(void);
 uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
 // A library applet in front of the game (the offline web page, hle_web.c / web_apple.m): while held, the game reads no buttons and centred sticks on every npad, as an application
 // out of focus does, and presses made meanwhile are dropped when the hold ends. dm_input_peek reads what the applet sees: every path ORed (any controller drives it), each stick

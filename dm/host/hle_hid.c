@@ -165,6 +165,10 @@ static void parse_keys(char *spec, key_step *st) {
         // a touch: T<x>x<y> with x, y normalized on the picture, origin top left ("f3000:T0.31x0.62", Super Mario Galaxy's file select in handheld mode)
         float tx, ty; if ((k[0] == 'T' || k[0] == 't') && sscanf(k + 1, "%fx%f", &tx, &ty) == 2) { st->tap = 1; st->tx = tx; st->ty = ty; found = 1; }
         if (!strcasecmp(k, "Shake")) { st->btn |= DM_BTN_SHAKE; found = 1; }   // the six-axis sensor shaken (Super Mario Odyssey's cap throw)
+        if (!strcasecmp(k, "Squeeze")) { st->btn |= DM_BTN_RING_SQUEEZE; found = 1; }
+        if (!strcasecmp(k, "Pull")) { st->btn |= DM_BTN_RING_PULL; found = 1; }
+        if (!strcasecmp(k, "SL")) { st->btn |= DM_BTN_LEFT_SL | DM_BTN_RIGHT_SL; found = 1; }
+        if (!strcasecmp(k, "SR")) { st->btn |= DM_BTN_LEFT_SR | DM_BTN_RIGHT_SR; found = 1; }
         if (!found) LOG("[RED] DM_KEYS unknown key name: %s", k);
         k = plus ? plus + 1 : NULL; }
 }
@@ -282,8 +286,15 @@ uint32_t dm_player_npad(int p) { return p <= 0 ? connected_id() : (uint32_t)p; }
 // The players with a controller (bit p = player p + 1, from the front end's dm_pad_players; player 1 always) and the npads the game supports (bit id for No1..No8, bit 8
 // Handheld, bit 9 Other: all of them until SetSupportedNpadIdType, as the hid service starts)
 static _Atomic uint32_t g_players = 1, g_ids_supported = 0x3ff;
+static _Atomic int g_joy_split;
+static _Atomic int g_joy_assign[DM_PLAYERS];
+static uint32_t g_hold_type;
 static uint32_t id_bit(uint32_t id) { return id < DM_PLAYERS ? 1u << id : id == NPAD_HANDHELD ? 1u << 8 : id == 0x10 ? 1u << 9 : 0; }
-static int reported(int p) { return p == 0 || (atomic_load(&g_players) >> p & 1 && atomic_load(&g_ids_supported) & id_bit((uint32_t)p)); }
+static int reported(int p) {
+    if (p == 0) return 1;
+    if (p == 1 && atomic_load(&g_joy_split)) return (atomic_load(&g_ids_supported) & id_bit(1)) != 0;
+    return (atomic_load(&g_players) >> p & 1) && (atomic_load(&g_ids_supported) & id_bit((uint32_t)p));
+}
 // Players with a controller whose npad the game does not support. A one-player game (no npad past No1 supported) gets them as player 1, so any controller plays it; in a game for
 // fewer players than are connected (a fifth controller in a four-player game) they are not used, as on the Switch, where the system does not connect them
 static uint32_t unsupported_players(void) {
@@ -299,9 +310,17 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
 static uint32_t g_styles_supported = 0xffffffffu;
 __attribute__((weak)) int dm_joycon_is_dual(void) { return 0; }
 __attribute__((weak)) int dm_joycon_count(void) { return 0; }
+__attribute__((weak)) void dm_ringcon_enable(int enable) { (void)enable; }
+__attribute__((weak)) int dm_ringcon_active(void) { return 0; }
+__attribute__((weak)) float dm_ringcon_force(void) { return 0.0f; }
 static uint32_t style_for_player(uint32_t id, int p) {
     if (p < 0) return 0;
     if (id == NPAD_HANDHELD) return STYLE_HANDHELD;
+    if (atomic_load(&g_joy_split)) {
+        if (p == 0 && (g_styles_supported & STYLE_JOYRIGHT)) return STYLE_JOYRIGHT;
+        if (p == 1 && (g_styles_supported & STYLE_JOYDUAL)) return STYLE_JOYDUAL;
+        if (p == 1 && (g_styles_supported & STYLE_JOYLEFT)) return STYLE_JOYLEFT;
+    }
     if (dm_joycon_is_dual()) {
         if (g_styles_supported & STYLE_JOYDUAL) return STYLE_JOYDUAL;
         if (g_styles_supported & STYLE_FULLKEY) return STYLE_FULLKEY;
@@ -441,11 +460,34 @@ static void rec_start(void) {
     LOG("DM_REC: recording player 1's input to %s as DM_KEYS steps in presented frames", e);
 }
 
+enum { RIGHT_BTN_MASK = 0x0c0006afull, LEFT_BTN_MASK = 0x0300f950ull };
+
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     memset(s, 0, sizeof *s);
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
     int pl = player_of(id);
     if (!(style_for_player(id, pl) & style)) return;   // no controller of this id / style: attributes = 0
+    int split = atomic_load(&g_joy_split) && id != NPAD_HANDHELD;
+    if (split && pl == 1) {
+        // Split Joy-Con mode: npad 1 holds the Left Joy-Con (Leg Strap) in JoyDual mode with only ATTR_LEFT_CONN set
+        uint64_t b = (atomic_load(&g_pad_btn[0]) | atomic_fetch_and(&g_pad_latch[0], ~(uint64_t)LEFT_BTN_MASK)) & LEFT_BTN_MASK;
+        uint64_t v = atomic_load(&g_pad_axes[0]);
+        int32_t a[4] = {ax(v, 0), ax(v, 1), 0, 0};
+        if (atomic_load(&g_players) >> 1 & 1) {
+            b |= atomic_load(&g_pad_btn[1]) | atomic_exchange(&g_pad_latch[1], 0);
+            uint64_t v1 = atomic_load(&g_pad_axes[1]);
+            for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v1, i));
+        }
+        s->lx = a[0]; s->ly = a[1]; s->rx = 0; s->ry = 0;
+        b &= 0x0f00ffffull;
+        if (s->lx < -STICK_THRESH) b |= 1u << 16;
+        if (s->ly > STICK_THRESH) b |= 1u << 17;
+        if (s->lx > STICK_THRESH) b |= 1u << 18;
+        if (s->ly < -STICK_THRESH) b |= 1u << 19;
+        s->buttons = b;
+        s->attributes = ATTR_CONNECTED | (style == STYLE_JOYLEFT ? 0 : ATTR_LEFT_CONN);
+        return;
+    }
     // Player 1: keyboard / touch, script, its controller and the players merged into it; another player: its own controller path
     uint32_t src = pl ? 1u << pl : 1u | merged_players();
     uint64_t b = 0; int32_t a[4] = {0};
@@ -455,7 +497,11 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         uint64_t k = atomic_load(&g_axes); for (int i = 0; i < 4; i++) a[i] = ax(k, i);
     }
     for (int p = 0; p < DM_PLAYERS; p++) if (src >> p & 1) {
-        b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
+        if (split && p == 0 && dm_joycon_count() > 0) {
+            b |= (atomic_load(&g_pad_btn[0]) | atomic_fetch_and(&g_pad_latch[0], ~(uint64_t)RIGHT_BTN_MASK)) & RIGHT_BTN_MASK;
+        } else {
+            b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
+        }
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
     }
     if (!pl) {   // the physical sources so far (DM_REC records them, DM_BTN_SHAKE only from player 1's own controller and the keyboard, as shake_note), then the scripted path
@@ -464,8 +510,17 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
     }
     if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
-    s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
-    b &= 0xffffull;
+    if (split && style == STYLE_JOYRIGHT) {
+        s->lx = 0; s->ly = 0;
+        s->rx = a[2]; s->ry = a[3];
+        if (!s->rx && !s->ry && (a[0] || a[1])) {
+            if (g_hold_type == 1) { s->rx = -a[1]; s->ry = a[0]; }
+            else { s->rx = a[0]; s->ry = a[1]; }
+        }
+    } else {
+        s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
+    }
+    b &= 0x0f00ffffull;
     if (s->lx < -STICK_THRESH) b |= 1u << 16;
     if (s->ly > STICK_THRESH) b |= 1u << 17;
     if (s->lx > STICK_THRESH) b |= 1u << 18;
@@ -475,7 +530,8 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (s->rx > STICK_THRESH) b |= 1u << 22;
     if (s->ry < -STICK_THRESH) b |= 1u << 23;
     s->buttons = b;
-    s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
+    if (style == STYLE_JOYRIGHT || style == STYLE_JOYLEFT) s->attributes = ATTR_CONNECTED;
+    else s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
 }
 // The cheat VM's key mask (hle_cheats.c "all keys of the mask held"): the OR of every player's controller buttons
 // (the keyboard / touch source's bits included) plus the eight stick-direction pseudo buttons of the merged axes —
@@ -534,13 +590,30 @@ HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "dual Joy-Co
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", "left Joy-Con states (not connected on the host)", int, h_hid_StatesJoyLeft, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYLEFT); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", "right Joy-Con states (not connected on the host)", int, h_hid_StatesJoyRight, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYRIGHT); }
 HLE_FORCE("_ZN2nn3hid14DisconnectNpadERKj", "disconnect a controller; ignored by the host", void, h_hid_Disconnect, const uint32_t *id) { (void)id; }
-static uint32_t g_hold_type;
+static void set_joy_single(const uint32_t *id, int dev_type, uint32_t *out_other) {
+    if (!id || *id >= DM_PLAYERS) return;
+    uint32_t i = *id;
+    atomic_store(&g_joy_assign[i], 1);
+    if (i == 0 && dev_type == 1 && !(g_styles_supported & STYLE_FULLKEY) && (g_styles_supported & STYLE_JOYRIGHT)) {
+        if (!atomic_exchange(&g_joy_split, 1)) {
+            LOG("hid: split Joy-Con mode enabled (npad 0 = Right Joy-Con, npad 1 = Left Joy-Con)");
+            style_changed(0);
+            style_changed(1);
+        }
+    }
+    if (out_other) *out_other = (i == 0) ? 1 : 0;
+    style_changed(i);
+}
 HLE_FORCE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", "Joy-Con hold orientation; the host only records it", void, h_hid_HoldType, int t) { g_hold_type = (uint32_t)t; }
-HLE_FORCE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", "Joy-Con assignment: dual", int, h_hid_GetJoyAssign, const uint32_t *id) { (void)id; return 0; }
-HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assignment; ignored by the host", void, h_hid_JoySingle, const uint32_t *id) { (void)id; }
+HLE_FORCE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", "Joy-Con assignment: 0 dual, 1 single", int, h_hid_GetJoyAssign, const uint32_t *id) {
+    return id && *id < DM_PLAYERS ? atomic_load(&g_joy_assign[*id]) : 0;
+}
+HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assignment", void, h_hid_JoySingle, const uint32_t *id) { set_joy_single(id, 1, NULL); }
 HLE_FORCE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", "swap controller ids; ignored by the host", void, h_hid_Swap, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid21StartLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStart, void) {}
 HLE_FORCE("_ZN2nn3hid20StopLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStop, void) {}
+HLE_FORCE("_ZN2nn3hid30SetNpadCaptureButtonAssignmentENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEENS2_ILi64ENS0_10NpadButtonEEE", "capture button assignment; ignored by the host", void, h_hid_SetCapBtn, uint32_t styles, uint64_t btns) { (void)styles; (void)btns; }
+HLE_FORCE("_ZN2nn3hid32ClearNpadCaptureButtonAssignmentEv", "capture button assignment clear; ignored by the host", void, h_hid_ClearCapBtn, void) {}
 // Controller applet (system UI): report the connected players right away, with player 1's controller selected. ControllerSupportResultInfo = { int playerCount; uint32_t selectedId; };
 // ControllerSupportArg starts with { int8 playerCountMin, playerCountMax }: the count is capped at the maximum. Fewer players than the minimum: on a Switch the applet stays open
 // until enough controllers connect or the player closes it, and the SDK's ShowControllerSupportCore (Mario Kart 8 Deluxe 4.0.0 sdk+0x24eeb0) turns the applet's result into
@@ -692,8 +765,13 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    int pl = player_of(h >> 8 & 0xff), shakes = pl == 0;
+    uint32_t id = (h >> 8) & 0xff;
+    int pl = player_of(id), shakes = pl == 0;
     uint32_t dev = (h >> 16) & 0xff;
+    if (atomic_load(&g_joy_split) && id != NPAD_HANDHELD) {
+        if (id == 0) { pl = 0; dev = 1; shakes = 1; }
+        else if (id == 1) { pl = 0; dev = 0; shakes = 1; }
+    }
     motion_state ms;
     if (motion_live_dev(pl, dev, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
     for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
@@ -750,14 +828,15 @@ HLE_FORCE("_ZN2nn3hid14GetNmouseStateEPNS0_11NmouseStateENS0_12NmouseHandleE", "
 HLE_FORCE("_ZN2nn3hid13GetNpadIdTypeEPjNS0_12NmouseHandleE", "mouse's controller: none (no device)", bool, h_hid_NmouseNpad, uint32_t *out, uint64_t h) { (void)out; (void)h; return false; }
 HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "six-axis sensor states: every requested entry, newest first",
           int, h_hid_SixStates, SixAxisState *out, int n, const uint32_t *h) { return six_states(out, n, *h); }
-// Vibration handles: byte 0 = SDK style index (FullKey 3, Handheld 4, JoyDual 5), byte 1 = npad id, byte 2 = motor.
+// Vibration handles: byte 0 = SDK style index (FullKey 3, Handheld 4, JoyDual 5, JoyLeft 6, JoyRight 7), byte 1 = npad id, byte 2 = motor.
 // See libnx hid.c _hidGetVibrationDeviceHandles. Only the styles this host connects are exposed.
 static uint32_t vib_targets(uint32_t h) {
     unsigned type = h & 0xff, id = h >> 8 & 0xff, motor = h >> 16 & 0xff;
-    if (h >> 24 || motor > 1 || (type != 3 && type != 4 && type != 5)) return 0;
+    if (h >> 24 || motor > 1 || type < 3 || type > 7) return 0;
     int p = player_of(id);
-    uint32_t expected_style = type == 5 ? STYLE_JOYDUAL : type == 4 ? STYLE_HANDHELD : STYLE_FULLKEY;
+    uint32_t expected_style = type == 7 ? STYLE_JOYRIGHT : type == 6 ? STYLE_JOYLEFT : type == 5 ? STYLE_JOYDUAL : type == 4 ? STYLE_HANDHELD : STYLE_FULLKEY;
     if (!(style_for_player(id, p) & expected_style)) return 0;
+    if (atomic_load(&g_joy_split) && (id == 0 || id == 1)) return dm_haptics_available() & 1u;
     return dm_haptics_available() & (p == 0 ? 1u | merged_players() : 1u << p);
 }
 static void vib_send(const uint32_t *handles, const dm_vibration *values, int n) {
@@ -767,8 +846,10 @@ static void vib_send(const uint32_t *handles, const dm_vibration *values, int n)
     for (int i = 0; i < n; i++) {
         uint32_t targets = vib_targets(handles[i]);
         if (!targets) unrouted++;
+        unsigned type = handles[i] & 0xff;
+        int m = type == 7 ? 1 : type == 6 ? 0 : (handles[i] >> 16 & 1);
         for (int p = 0; p < DM_PLAYERS; p++) if (targets >> p & 1) {
-            int m = handles[i] >> 16 & 1, k = p * 2 + m;
+            int k = p * 2 + m;
             updates[k] = (dm_vibration_update){p, m, values[i]}; used |= 1u << k;
         }
     }
@@ -796,8 +877,10 @@ HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiR
         if (getenv("DM_RUMBLE_LOG") && id) LOG("rumble: game asked for vibration handles of npad %u style %#x: none (connected style %#x, %s)", *id, style, style_of(*id), dm_haptics_has_output() ? "output ready" : "no output yet");
         return 0;
     }
-    uint32_t base = (*id << 8) | (*id == NPAD_HANDHELD ? 4u : (style & STYLE_JOYDUAL) ? 5u : 3u);
-    int count = n < 2 ? n : 2;
+    uint32_t type = *id == NPAD_HANDHELD ? 4u : (style & STYLE_JOYRIGHT) ? 7u : (style & STYLE_JOYLEFT) ? 6u : (style & STYLE_JOYDUAL) ? 5u : 3u;
+    uint32_t base = (*id << 8) | type;
+    int max_m = (type == 6 || type == 7) ? 1 : 2;
+    int count = n < max_m ? n : max_m;
     for (int i = 0; i < count; i++) h[i] = base | (uint32_t)i << 16;
     if (getenv("DM_RUMBLE_LOG")) LOG("rumble: game asked for vibration handles of npad %u style %#x: %d, first %#x", *id, style, count, h[0]);
     return count;
@@ -845,10 +928,24 @@ HLE_FORCE("_ZN2nn3hid24GetNpadCommunicationModeEv", "wireless communication mode
 HLE_FORCE("_ZN2nn3hid24SetNpadCommunicationModeENS0_21NpadCommunicationModeE", "wireless communication mode; the host only records it", void, h_hid_SetComm, int m) { g_comm_mode = (uint32_t)m; }
 HLE_FORCE("_ZN2nn3hid29GetNpadHandheldActivationModeEv", "handheld activation mode: returns the value that was set", int, h_hid_GetHh, void) { return (int)g_hh_mode; }
 HLE_FORCE("_ZN2nn3hid29SetNpadHandheldActivationModeENS0_26NpadHandheldActivationModeE", "handheld activation mode; the host only records it", void, h_hid_SetHh, int m) { g_hh_mode = (uint32_t)m; }
-HLE_FORCE("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", "Joy-Con dual assignment; ignored by the host", void, h_hid_JoyDual, const uint32_t *id) { (void)id; }
-HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", "Joy-Con single assignment (left or right given); ignored by the host", void, h_hid_JoySingleT, const uint32_t *id, int t) { (void)id; (void)t; }
-HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleEPjRKjNS0_17NpadJoyDeviceTypeE", "Joy-Con single assignment (returning the other half); ignored by the host, there is no other half", int, h_hid_JoySingleOut, uint32_t *out, const uint32_t *id, int t) { (void)out; (void)id; (void)t; return 0; }
-HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons; ignored by the host, reports success", Result, h_hid_Merge, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", "Joy-Con dual assignment", void, h_hid_JoyDual, const uint32_t *id) {
+    if (!id || *id >= DM_PLAYERS) return;
+    uint32_t i = *id;
+    atomic_store(&g_joy_assign[i], 0);
+    if (i == 0 && atomic_exchange(&g_joy_split, 0)) {
+        style_changed(0);
+        style_changed(1);
+    }
+    style_changed(i);
+}
+HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", "Joy-Con single assignment (left or right given)", void, h_hid_JoySingleT, const uint32_t *id, int t) { set_joy_single(id, t, NULL); }
+HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleEPjRKjNS0_17NpadJoyDeviceTypeE", "Joy-Con single assignment (returning the other half)", int, h_hid_JoySingleOut, uint32_t *out, const uint32_t *id, int t) { set_joy_single(id, t, out); return out != NULL; }
+HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons", Result, h_hid_Merge, const uint32_t *a, const uint32_t *b) {
+    if (a && *a < DM_PLAYERS) atomic_store(&g_joy_assign[*a], 0);
+    if (b && *b < DM_PLAYERS) atomic_store(&g_joy_assign[*b], 0);
+    if (atomic_exchange(&g_joy_split, 0)) { style_changed(0); style_changed(1); }
+    return RES_OK;
+}
 // Bound and signalled once when its controller is connected (the hid service reports the controller already attached at start the same way), and again whenever a player's controller
 // comes or goes (dm_pad_players). Link's Awakening reads no controller state until this event has fired: without it GetNpadState was never called and the title's "Press L+R" never saw a press
 HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for a connected controller and on connect / disconnect", void, h_hid_BindStyleEv,
@@ -899,8 +996,13 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states,
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
 HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless player 1's is shaking or a live controller is turning", unsigned, h_hid_SixRest, const uint32_t *h) {
-    int pl = player_of(*h >> 8 & 0xff);
+    uint32_t id = (*h >> 8) & 0xff;
+    int pl = player_of(id);
     uint32_t dev = (*h >> 16) & 0xff;
+    if (atomic_load(&g_joy_split) && id != NPAD_HANDHELD) {
+        if (id == 0) { pl = 0; dev = 1; }
+        else if (id == 1) { pl = 0; dev = 0; }
+    }
     motion_state ms;
     if (motion_live_dev(pl, dev, &ms)) return fabsf(ms.gyro[0]) + fabsf(ms.gyro[1]) + fabsf(ms.gyro[2]) < 0.01f && !(pl == 0 && shaking(guest_ns()));
     return pl != 0 || !shaking(guest_ns());
@@ -980,3 +1082,227 @@ PALMA_FAIL("_ZN2nn3hid37SetPalmaDataBaseIdentificationVersionERKNS0_21PalmaConne
 PALMA_FAIL("_ZN2nn3hid19SuspendPalmaFeatureERKNS0_21PalmaConnectionHandleERKNS_4util10BitFlagSetILi32ENS0_12PalmaFeatureEEE", "feature suspension", h_hid_PalmaSuspend, const void *h, const void *f)
 PALMA_FAIL("_ZN2nn3hid16ReadPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log read", h_hid_PalmaLogRead, const void *h, const uint16_t *i)
 PALMA_FAIL("_ZN2nn3hid17ResetPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log reset", h_hid_PalmaLogReset, const void *h, const uint16_t *i)
+
+// ---------- hidbus: external rail accessory bus (Ring-Con on Player 1's Right Joy-Con, Ring Fit Adventure) ----------
+#define RES_HIDBUS_NO_DEVICE (218u | (7u << 9))   // 0xeda: external device not connected on this rail
+typedef struct { uint32_t abstracted_pad_id; uint8_t internal_index, player_number, bus_type_id, is_valid; } HidbusHandle;
+_Static_assert(sizeof(HidbusHandle) == 8, "HidbusHandle");
+typedef struct { uint8_t data[0x30]; uint64_t out_size, sampling; } JoyPollingData;
+_Static_assert(sizeof(JoyPollingData) == 0x40, "JoyPollingData");
+
+static _Atomic int64_t g_hidbus_sampling = 1 << 16;
+static _Atomic uint32_t g_ring_rep_count, g_ring_total_push_count;
+static _Atomic int g_ring_was_squeezed;
+static pthread_mutex_t g_ring_cal_mu = PTHREAD_MUTEX_INITIALIZER;
+static int16_t g_ring_user_cal[4] = {2500, -2500, 2280, 0};
+
+static int hidbus_log_en(void) {
+    static int s = -1;
+    if (s < 0) s = getenv("DM_HIDBUS_LOG") != NULL;
+    return s;
+}
+
+static int ringcon_on_handle(const HidbusHandle *h) {
+    return h && h->is_valid && h->player_number == 0;
+}
+
+static uint8_t ringcon_crc8(const void *data, size_t len) {
+    const uint8_t *p = data;
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x8d) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static int16_t ringcon_sensor_value(void) {
+    keys_sync();
+    uint64_t b = atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_load(&g_pad_btn[0]);
+    float force = 0.0f;
+    if (b & DM_BTN_RING_SQUEEZE) force = 1.0f;
+    else if (b & DM_BTN_RING_PULL) force = -1.0f;
+    else if (dm_ringcon_active()) force = dm_ringcon_force();
+
+    int squeezed = force > 0.4f;
+    if (squeezed && !atomic_exchange(&g_ring_was_squeezed, 1)) {
+        atomic_fetch_add(&g_ring_rep_count, 1);
+        atomic_fetch_add(&g_ring_total_push_count, 1);
+    } else if (!squeezed && force < 0.2f) {
+        atomic_store(&g_ring_was_squeezed, 0);
+    }
+
+    int32_t val = 2280 + (int32_t)lrintf(force * 2500.0f);
+    if (val < -32768) val = -32768;
+    if (val > 32767) val = 32767;
+    return (int16_t)val;
+}
+
+static Result ringcon_fill_polling(JoyPollingData *out, int count, const HidbusHandle *h) {
+    if (!out || count <= 0) return RES_OK;
+    if (!ringcon_on_handle(h)) {
+        memset(out, 0, (size_t)count * sizeof *out);
+        return RES_HIDBUS_NO_DEVICE;
+    }
+    int16_t sv = ringcon_sensor_value();
+    int64_t top = atomic_fetch_add(&g_hidbus_sampling, 1) + 1;
+    for (int i = 0; i < count; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        memcpy(out[i].data + 4, &sv, sizeof sv);
+        out[i].out_size = 8;
+        out[i].sampling = (uint64_t)(top - i);
+    }
+    return RES_OK;
+}
+
+HLE_FORCE("_ZN2nn6hidbus10InitializeEv", "hidbus initialization", Result, h_hidbus_Init, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn6hidbus10InitializeERKNS0_9BusHandleE", "hidbus handle initialization", Result, h_hidbus_InitH, const HidbusHandle *h) {
+    if (hidbus_log_en() && h) LOG("hidbus::Initialize(player=%u, bus=%u)", h->player_number, h->bus_type_id);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus8FinalizeEv", "hidbus finalization", Result, h_hidbus_Fini, void) { dm_ringcon_enable(0); return RES_OK; }
+HLE_FORCE("_ZN2nn6hidbus8FinalizeERKNS0_9BusHandleE", "hidbus handle finalization", Result, h_hidbus_FiniH, const HidbusHandle *h) {
+    if (ringcon_on_handle(h)) dm_ringcon_enable(0);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus12GetBusHandleEPNS0_9BusHandleERKjNS0_7BusTypeE", "hidbus handle for an npad and rail bus type",
+          unsigned, h_hidbus_GetHandle, HidbusHandle *out, const uint32_t *id, uint64_t bus_type) {
+    if (!out || !id) return 0;
+    memset(out, 0, sizeof *out);
+    uint8_t player = (*id == NPAD_HANDHELD) ? 0 : (uint8_t)(*id & 0xff);
+    out->abstracted_pad_id = player;
+    out->internal_index = player;
+    out->player_number = player;
+    out->bus_type_id = (uint8_t)(bus_type & 0xff);
+    out->is_valid = 1;
+    LOG("hidbus::GetBusHandle(id=%#x, bus=%llu) -> player=%u", *id, (unsigned long long)bus_type, out->player_number);
+    return 1;
+}
+HLE_FORCE("_ZN2nn6hidbus20EnableExternalDeviceERKNS0_9BusHandleEbj", "hidbus external device enable (Ring-Con 0x2000 on Player 1 Right Joy-Con)",
+          Result, h_hidbus_EnableDev, const HidbusHandle *h, unsigned on, uint32_t dev_id) {
+    (void)dev_id;
+    if (!ringcon_on_handle(h)) return RES_HIDBUS_NO_DEVICE;
+    dm_ringcon_enable(on != 0);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus20EnableExternalDeviceEbjRKNS0_9BusHandleE", "hidbus external device enable (Ring-Con 0x2000 on Player 1 Right Joy-Con)",
+          Result, h_hidbus_EnableDev2, unsigned on, uint32_t dev_id, const HidbusHandle *h) {
+    if (hidbus_log_en() && h) LOG("hidbus::EnableExternalDevice(on=%u, dev=%#x, player=%u, bus=%u)", on, dev_id, h->player_number, h->bus_type_id);
+    if (!ringcon_on_handle(h)) return RES_HIDBUS_NO_DEVICE;
+    dm_ringcon_enable(on != 0);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus27EnableJoyPollingReceiveModeERKNS0_9BusHandleEPvmNS0_14JoyPollingModeE", "hidbus Ring-Con polling receive mode enable",
+          Result, h_hidbus_EnablePoll, const HidbusHandle *h, void *work, size_t sz, int mode) {
+    (void)work; (void)sz; (void)mode;
+    if (!ringcon_on_handle(h)) return RES_HIDBUS_NO_DEVICE;
+    dm_ringcon_enable(1);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus27EnableJoyPollingReceiveModeERKNS0_9BusHandleEPKvmPvmNS0_14JoyPollingModeE", "hidbus Ring-Con polling receive mode enable",
+          Result, h_hidbus_EnablePoll2, const HidbusHandle *h, const void *cmd, size_t cmd_sz, void *work, size_t sz, int mode) {
+    (void)cmd; (void)cmd_sz; (void)work; (void)sz;
+    if (hidbus_log_en() && h) LOG("hidbus::EnableJoyPollingReceiveMode(player=%u, bus=%u, mode=%d)", h->player_number, h->bus_type_id, mode);
+    if (!ringcon_on_handle(h)) return RES_HIDBUS_NO_DEVICE;
+    dm_ringcon_enable(1);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus28DisableJoyPollingReceiveModeERKNS0_9BusHandleE", "hidbus Ring-Con polling receive mode disable",
+          Result, h_hidbus_DisablePoll, const HidbusHandle *h) {
+    (void)h;
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn6hidbus25GetJoyPollingReceivedDataEPNS0_22JoyPollingReceivedDataERKNS0_9BusHandleE", "hidbus Ring-Con single polling sample",
+          Result, h_hidbus_GetPoll1, JoyPollingData *out, const HidbusHandle *h) {
+    return ringcon_fill_polling(out, 1, h);
+}
+HLE_FORCE("_ZN2nn6hidbus25GetJoyPollingReceivedDataEPNS0_22JoyPollingReceivedDataEiRKNS0_9BusHandleE", "hidbus Ring-Con polling sample history",
+          Result, h_hidbus_GetPollN, JoyPollingData *out, int count, const HidbusHandle *h) {
+    return ringcon_fill_polling(out, count, h);
+}
+HLE_FORCE("_ZN2nn6hidbus14SendAndReceiveEPmPvmRKNS0_9BusHandleEPKvm", "hidbus Ring-Con synchronous command",
+          Result, h_hidbus_SendRecv, uint64_t *out_size, void *out_buf, size_t out_max, const HidbusHandle *h, const void *in_buf, size_t in_size) {
+    if (out_size) *out_size = 0;
+    if (!ringcon_on_handle(h)) return RES_HIDBUS_NO_DEVICE;
+    if (!in_buf || in_size < 4 || !out_buf) return RES_OK;
+    uint32_t cmd = 0;
+    memcpy(&cmd, in_buf, 4);
+    uint8_t resp[32] = {0};
+    size_t rlen = 0;
+    switch (cmd) {
+        case 0x00020000u: // GetFirmwareVersion: {status=0, sub=0, main=0x2c, pad=0}
+            resp[5] = 0x2c;
+            rlen = 8;
+            break;
+        case 0x00020100u: { // ReadId: 6 hardware ID halfwords from real Ring-Con
+            static const uint16_t id[6] = {8, 41, 22294, 19777, 13621, 8245};
+            memcpy(resp + 4, id, sizeof id);
+            rlen = 16;
+            break;
+        }
+        case 0x00020105u: // Cmd020105 status query: {status=0, data=1}
+            resp[4] = 1;
+            rlen = 8;
+            break;
+        case 0x00020504u: // ReadUnkCal: {status=0, data=0, pad=0}
+            rlen = 8;
+            break;
+        case 0x00020A04u: { // ReadFactoryCal: {status=0, os_max=4900, hk_max=-340, zero_min=2160, zero_max=2400}
+            static const int32_t fcal[4] = {4900, -340, 2160, 2400};
+            memcpy(resp + 4, fcal, sizeof fcal);
+            rlen = 20;
+            break;
+        }
+        case 0x00021A04u: { // ReadUserCal: {os_max=2500, hk_max=-2500, zero=2280, pad=0} with CRC8 (poly 0x8d) at byte +2
+            pthread_mutex_lock(&g_ring_cal_mu);
+            for (int i = 0; i < 4; i++) {
+                int16_t v = g_ring_user_cal[i];
+                memcpy(resp + 4 + i * 4, &v, 2);
+                resp[4 + i * 4 + 2] = ringcon_crc8(&v, 2);
+            }
+            pthread_mutex_unlock(&g_ring_cal_mu);
+            rlen = 20;
+            break;
+        }
+        case 0x00023104u: { // ReadRepCount: 3-byte count + 1-byte CRC8 over 4 bytes (count[0..2], 0)
+            uint32_t c = atomic_load(&g_ring_rep_count) & 0xffffffu;
+            uint8_t b4[4] = {(uint8_t)(c & 0xff), (uint8_t)((c >> 8) & 0xff), (uint8_t)((c >> 16) & 0xff), 0};
+            memcpy(resp + 4, b4, 3);
+            resp[7] = ringcon_crc8(b4, 4);
+            rlen = 8;
+            break;
+        }
+        case 0x00023204u: { // ReadTotalPushCount: 3-byte count + 1-byte CRC8 over 4 bytes (count[0..2], 0)
+            uint32_t c = atomic_load(&g_ring_total_push_count) & 0xffffffu;
+            uint8_t b4[4] = {(uint8_t)(c & 0xff), (uint8_t)((c >> 8) & 0xff), (uint8_t)((c >> 16) & 0xff), 0};
+            memcpy(resp + 4, b4, 3);
+            resp[7] = ringcon_crc8(b4, 4);
+            rlen = 8;
+            break;
+        }
+        case 0x04013104u: // ResetRepCount
+            atomic_store(&g_ring_rep_count, 0);
+            rlen = 4;
+            break;
+        case 0x10011A04u: // SaveCalData (20 bytes in_buf: 4-byte cmd + 4x {int16_t val, uint8_t crc, uint8_t pad})
+            if (in_size >= 20) {
+                const uint8_t *in_b = (const uint8_t *)in_buf;
+                pthread_mutex_lock(&g_ring_cal_mu);
+                for (int i = 0; i < 4; i++) memcpy(&g_ring_user_cal[i], in_b + 4 + i * 4, 2);
+                pthread_mutex_unlock(&g_ring_cal_mu);
+            }
+            rlen = 4;
+            break;
+        default:
+            LOG("[RED] hidbus::SendAndReceive unknown Ring-Con command %#x (in_size %zu, out_max %zu)", cmd, in_size, out_max);
+            rlen = out_max >= 4 ? 4 : out_max;
+            break;
+    }
+    if (rlen > out_max) rlen = out_max;
+    memcpy(out_buf, resp, rlen);
+    if (out_size) *out_size = rlen;
+    if (hidbus_log_en()) LOG("hidbus::SendAndReceive cmd=%#010x -> rlen=%zu", cmd, rlen);
+    return RES_OK;
+}
