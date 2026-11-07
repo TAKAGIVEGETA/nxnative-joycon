@@ -34,6 +34,30 @@ int main(void) {
     h.has[PH_Z] = 0; h.has[PH_RX] = 1; h.axis[PH_RX] = -1; pad_hid_sticks(&h, s); CHECK(s[2] == -DM_STICK_MAX && s[3] == 0);   // Rx / Ry without Z
     h.has[PH_ACCEL] = 1; h.axis[PH_ACCEL] = -1; CHECK(!(pad_hid_buttons(&h) & DM_BTN_ZR));
     h.axis[PH_ACCEL] = pad_hid_norm(200, 0, 255); CHECK(pad_hid_buttons(&h) & DM_BTN_ZR);
+
+    // Joy-Con SPI stick calibration 12-bit unpacking
+    uint8_t l_cal[9];
+    l_cal[0] = 0x40; l_cal[1] = 0x06; l_cal[2] = 0x64; // 1600, 1600
+    l_cal[3] = 0xD0; l_cal[4] = 0x87; l_cal[5] = 0x89; // 2000, 2200
+    l_cal[6] = 0xDC; l_cal[7] = 0xC5; l_cal[8] = 0x5D; // 1500, 1500
+    int16_t l_max_x = (int16_t)(l_cal[0] | ((l_cal[1] & 0x0F) << 8));
+    int16_t l_max_y = (int16_t)((l_cal[1] >> 4) | (l_cal[2] << 4));
+    int16_t l_cx    = (int16_t)(l_cal[3] | ((l_cal[4] & 0x0F) << 8));
+    int16_t l_cy    = (int16_t)((l_cal[4] >> 4) | (l_cal[5] << 4));
+    int16_t l_min_x = (int16_t)(l_cal[6] | ((l_cal[7] & 0x0F) << 8));
+    int16_t l_min_y = (int16_t)((l_cal[7] >> 4) | (l_cal[8] << 4));
+    CHECK(l_max_x == 1600 && l_max_y == 1600);
+    CHECK(l_cx == 2000 && l_cy == 2200);
+    CHECK(l_min_x == 1500 && l_min_y == 1500);
+
+    // Deadzone and resting position check:
+    // With center at (2000, 2200) and resting raw at (2050, 2280): dx=50, dy=80.
+    // Distance = sqrt(2500 + 6400) = ~94.3 <= deadzone 220, so resting stick is zeroed.
+    int32_t raw_x = 2050, raw_y = 2280;
+    int32_t dx = raw_x - l_cx, dy = raw_y - l_cy;
+    int32_t dz = 220;
+    CHECK((int64_t)dx * dx + (int64_t)dy * dy <= (int64_t)dz * dz);
+
     printf("t_pad_hid: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

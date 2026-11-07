@@ -41,6 +41,10 @@ typedef struct joycon_device {
     int16_t gyr_offset[3];
     int16_t gyr_scale[3];
     float gyro_bias[3];
+    int16_t stick_center[2];
+    int16_t stick_min[2];
+    int16_t stick_max[2];
+    int16_t stick_deadzone;
     uint8_t last_pkt_id;
     int has_pkt_id;
     uint64_t imu_ns;
@@ -429,14 +433,110 @@ static void joycon_load_imu_calibration(joycon_device *d) {
         d->gyr_scale[0], d->gyr_scale[1], d->gyr_scale[2]);
 }
 
+static void joycon_load_stick_calibration(joycon_device *d) {
+    uint8_t magic[2] = {0};
+    uint8_t cal[9] = {0};
+    int is_user = 0;
+    uint16_t user_magic_addr = d->is_left ? 0x8010 : 0x801B;
+    uint16_t user_data_addr  = d->is_left ? 0x8012 : 0x801D;
+    uint16_t factory_addr    = d->is_left ? 0x603D : 0x6046;
+    uint16_t param_addr      = d->is_left ? 0x6086 : 0x6098;
+
+    if (joycon_read_spi(d, user_magic_addr, 2, magic) && magic[0] == 0xB2 && magic[1] == 0xA1) {
+        if (joycon_read_spi(d, user_data_addr, 9, cal)) is_user = 1;
+    }
+    if (!is_user && !joycon_read_spi(d, factory_addr, 9, cal)) return;
+
+    int16_t center_x, center_y, max_above_x, max_above_y, min_below_x, min_below_y;
+    if (d->is_left) {
+        max_above_x = (int16_t)(cal[0] | ((cal[1] & 0x0F) << 8));
+        max_above_y = (int16_t)((cal[1] >> 4) | (cal[2] << 4));
+        center_x    = (int16_t)(cal[3] | ((cal[4] & 0x0F) << 8));
+        center_y    = (int16_t)((cal[4] >> 4) | (cal[5] << 4));
+        min_below_x = (int16_t)(cal[6] | ((cal[7] & 0x0F) << 8));
+        min_below_y = (int16_t)((cal[7] >> 4) | (cal[8] << 4));
+    } else {
+        center_x    = (int16_t)(cal[0] | ((cal[1] & 0x0F) << 8));
+        center_y    = (int16_t)((cal[1] >> 4) | (cal[2] << 4));
+        min_below_x = (int16_t)(cal[3] | ((cal[4] & 0x0F) << 8));
+        min_below_y = (int16_t)((cal[4] >> 4) | (cal[5] << 4));
+        max_above_x = (int16_t)(cal[6] | ((cal[7] & 0x0F) << 8));
+        max_above_y = (int16_t)((cal[7] >> 4) | (cal[8] << 4));
+    }
+
+    if (center_x >= 500 && center_x <= 3500 && center_y >= 500 && center_y <= 3500 &&
+        max_above_x >= 300 && min_below_x >= 300 && max_above_y >= 300 && min_below_y >= 300) {
+        d->stick_center[0] = center_x;
+        d->stick_center[1] = center_y;
+        d->stick_max[0] = center_x + max_above_x;
+        d->stick_min[0] = center_x - min_below_x;
+        d->stick_max[1] = center_y + max_above_y;
+        d->stick_min[1] = center_y - min_below_y;
+    }
+
+    uint8_t params[9] = {0};
+    if (joycon_read_spi(d, param_addr, 9, params)) {
+        uint16_t dz = (uint16_t)(params[3] | ((params[4] & 0x0F) << 8));
+        if (dz >= 80 && dz <= 400) {
+            d->stick_deadzone = (int16_t)dz;
+        }
+    }
+
+    LOG("[hid] Joy-Con (%s) stick %s calibration: center=(%d,%d) min=(%d,%d) max=(%d,%d) deadzone=%d",
+        d->is_left ? "L" : "R", is_user ? "user" : "factory",
+        d->stick_center[0], d->stick_center[1],
+        d->stick_min[0], d->stick_min[1],
+        d->stick_max[0], d->stick_max[1],
+        d->stick_deadzone);
+}
+
+static void joycon_process_stick(joycon_device *d, uint16_t raw_x, uint16_t raw_y, int32_t *out_x, int32_t *out_y) {
+    int32_t cx = d->stick_center[0] ? d->stick_center[0] : 2048;
+    int32_t cy = d->stick_center[1] ? d->stick_center[1] : 2048;
+    int32_t dx = (int32_t)raw_x - cx;
+    int32_t dy = (int32_t)raw_y - cy;
+    int32_t dz = d->stick_deadzone > 0 ? d->stick_deadzone : 200;
+    const char *env_dz = getenv("DM_JOYCON_DEADZONE");
+    if (env_dz && atoi(env_dz) > 0) dz = atoi(env_dz);
+    else if (dz < 220) dz = 220;
+
+    int64_t dist_sq = (int64_t)dx * dx + (int64_t)dy * dy;
+    if (dist_sq <= (int64_t)dz * dz) {
+        *out_x = 0;
+        *out_y = 0;
+        return;
+    }
+
+    float dist = sqrtf((float)dist_sq);
+    float factor = (dist - (float)dz) / dist;
+    float fdx = (float)dx * factor;
+    float fdy = (float)dy * factor;
+
+    int32_t max_x = (d->stick_max[0] > cx + dz) ? (d->stick_max[0] - cx - dz) : (1600 - dz);
+    int32_t min_x = (cx - dz > d->stick_min[0]) ? (cx - dz - d->stick_min[0]) : (1600 - dz);
+    int32_t max_y = (d->stick_max[1] > cy + dz) ? (d->stick_max[1] - cy - dz) : (1600 - dz);
+    int32_t min_y = (cy - dz > d->stick_min[1]) ? (cy - dz - d->stick_min[1]) : (1600 - dz);
+    if (max_x <= 0) max_x = 1;
+    if (min_x <= 0) min_x = 1;
+    if (max_y <= 0) max_y = 1;
+    if (min_y <= 0) min_y = 1;
+
+    float sx = (fdx > 0.0f) ? (fdx * 32767.0f / (float)max_x) : (fdx * 32767.0f / (float)min_x);
+    float sy = (fdy > 0.0f) ? (fdy * 32767.0f / (float)max_y) : (fdy * 32767.0f / (float)min_y);
+
+    *out_x = (int32_t)fminf(fmaxf(sx, -32767.0f), 32767.0f);
+    *out_y = (int32_t)fminf(fmaxf(sy, -32767.0f), 32767.0f);
+}
+
 static void joycon_maybe_start_ringcon(joycon_device *d);
 
 static void *joycon_init_thread(void *arg) {
     joycon_device *d = arg;
     atomic_store(&d->ring_probing, 1);
 
-    // 1. Read SPI flash IMU calibration (user 0x8026/0x8028 or factory 0x6020)
+    // 1. Read SPI flash IMU and stick calibrations
     joycon_load_imu_calibration(d);
+    joycon_load_stick_calibration(d);
 
     // 2. Enable 6-axis IMU (ENABLE_IMU = 0x40, arg = 0x01)
     uint8_t imu_on = 0x01;
@@ -586,9 +686,9 @@ static void joycon_decode_imu(joycon_device *d, const uint8_t *b_imu, float acc_
         v[i] = (int16_t)((uint16_t)b_imu[2 * i] | ((uint16_t)b_imu[2 * i + 1] << 8));
     }
     // Match Eden's JoyconPoller::GetMotionInput (poller.cpp:313-372)
-    float ax = (float)v[1] * 4.0f / (float)(d->acc_scale[1] - d->acc_offset[1]);
-    float ay = (float)v[0] * 4.0f / (float)(d->acc_scale[0] - d->acc_offset[0]);
-    float az = (float)v[2] * 4.0f / (float)(d->acc_scale[2] - d->acc_offset[2]);
+    float ax = (float)(v[1] - d->acc_offset[1]) * 4.0f / (float)(d->acc_scale[1] - d->acc_offset[1]);
+    float ay = (float)(v[0] - d->acc_offset[0]) * 4.0f / (float)(d->acc_scale[0] - d->acc_offset[0]);
+    float az = (float)(v[2] - d->acc_offset[2]) * 4.0f / (float)(d->acc_scale[2] - d->acc_offset[2]);
 
     const float deg_to_rad = (float)M_PI / 180.0f;
     float gx = (float)(v[4] - d->gyr_offset[1]) * (936.0f * deg_to_rad) / (float)(d->gyr_scale[1] - d->gyr_offset[1]);
@@ -685,12 +785,10 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         // Stick
         uint16_t raw_lx = (uint16_t)(r[6] | ((r[7] & 0x0f) << 8));
         uint16_t raw_ly = (uint16_t)((r[7] >> 4) | (r[8] << 4));
-        int32_t dx = (int32_t)raw_lx - 2048;
-        int32_t dy = (int32_t)raw_ly - 2048;
-        if (abs(dx) < 150) dx = 0;
-        if (abs(dy) < 150) dy = 0;
-        atomic_store(&g_jc_left_lx, (int32_t)fminf(fmaxf((float)dx * 32767.f / 1600.f, -32767.f), 32767.f));
-        atomic_store(&g_jc_left_ly, (int32_t)fminf(fmaxf((float)dy * 32767.f / 1600.f, -32767.f), 32767.f));
+        int32_t lx, ly;
+        joycon_process_stick(d, raw_lx, raw_ly, &lx, &ly);
+        atomic_store(&g_jc_left_lx, lx);
+        atomic_store(&g_jc_left_ly, ly);
 
         if (new_imu_pkt) {
             uint64_t step_ns = 5000000;
@@ -723,12 +821,10 @@ static void joycon_report(void *ctx, IOReturn result, void *sender, IOHIDReportT
         // Stick
         uint16_t raw_rx = (uint16_t)(r[9] | ((r[10] & 0x0f) << 8));
         uint16_t raw_ry = (uint16_t)((r[10] >> 4) | (r[11] << 4));
-        int32_t dx = (int32_t)raw_rx - 2048;
-        int32_t dy = (int32_t)raw_ry - 2048;
-        if (abs(dx) < 150) dx = 0;
-        if (abs(dy) < 150) dy = 0;
-        atomic_store(&g_jc_right_rx, (int32_t)fminf(fmaxf((float)dx * 32767.f / 1600.f, -32767.f), 32767.f));
-        atomic_store(&g_jc_right_ry, (int32_t)fminf(fmaxf((float)dy * 32767.f / 1600.f, -32767.f), 32767.f));
+        int32_t rx, ry;
+        joycon_process_stick(d, raw_rx, raw_ry, &rx, &ry);
+        atomic_store(&g_jc_right_rx, rx);
+        atomic_store(&g_jc_right_ry, ry);
 
         if (report_id == 0x30) {
             int ring_on = atomic_load(&d->ring_connected);
@@ -797,6 +893,10 @@ static void joycon_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRe
         d->acc_scale[i] = 0x4000;
         d->gyr_scale[i] = 0x3be7;
     }
+    d->stick_center[0] = 2048; d->stick_center[1] = 2048;
+    d->stick_min[0] = 448;     d->stick_min[1] = 448;
+    d->stick_max[0] = 3648;    d->stick_max[1] = 3648;
+    d->stick_deadzone = 220;
     atomic_store(&d->refs, 1);
     pthread_mutex_init(&d->subcmd_lock, NULL);
     pthread_cond_init(&d->subcmd_cv, NULL);

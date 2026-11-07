@@ -536,10 +536,44 @@ static void t_motion_dual_joycon(void) {
     g_phone_mode = -1;
 }
 
+static int g_test_joycon_count = 0;
+static int get_test_joycon_count(void) { return g_test_joycon_count; }
+
+static void t_split_joycon_sticks(void) {
+    g_joycon_count_test = get_test_joycon_count;
+    int saved_mode = g_mode; g_mode = 1;
+    uint32_t saved_styles = g_styles_supported;
+    g_styles_supported = STYLE_JOYRIGHT | STYLE_JOYLEFT | STYLE_JOYDUAL;
+    atomic_store(&g_joy_split, 1);
+
+    // Test 1: dm_joycon_count() == 0 (e.g. keyboard fallback)
+    // Left stick deflected, right stick zero: should copy to right stick
+    g_test_joycon_count = 0;
+    dm_pad_set(0, 10000, 12000, 0, 0);
+    NpadState st;
+    fill(&st, 0, STYLE_JOYRIGHT);
+    CHECK(st.rx == 10000 && st.ry == 12000, "keyboard fallback routes left stick to right Joy-Con when no Joy-Cons connected");
+
+    // Test 2: dm_joycon_count() == 2 (physical Joy-Cons connected)
+    // Left stick deflected, right stick zero: should NOT copy to right stick!
+    g_test_joycon_count = 2;
+    fill(&st, 0, STYLE_JOYRIGHT);
+    CHECK(st.rx == 0 && st.ry == 0, "physical Joy-Con does not route left stick drift onto right Joy-Con");
+
+    // Clear state
+    dm_pad_set(0, 0, 0, 0, 0);
+    atomic_store(&g_joy_split, 0);
+    g_styles_supported = saved_styles;
+    g_mode = saved_mode;
+    g_test_joycon_count = 0;
+    g_joycon_count_test = NULL;
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
+    t_split_joycon_sticks();
     t_script();
     t_vibration();
     t_rumble_log();

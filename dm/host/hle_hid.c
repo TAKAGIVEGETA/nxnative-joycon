@@ -309,7 +309,8 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
 }
 static uint32_t g_styles_supported = 0xffffffffu;
 __attribute__((weak)) int dm_joycon_is_dual(void) { return 0; }
-__attribute__((weak)) int dm_joycon_count(void) { return 0; }
+static int (*g_joycon_count_test)(void);
+__attribute__((weak)) int dm_joycon_count(void) { return g_joycon_count_test ? g_joycon_count_test() : 0; }
 __attribute__((weak)) void dm_ringcon_enable(int enable) { (void)enable; }
 __attribute__((weak)) int dm_ringcon_active(void) { return 0; }
 __attribute__((weak)) float dm_ringcon_force(void) { return 0.0f; }
@@ -513,7 +514,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (split && style == STYLE_JOYRIGHT) {
         s->lx = 0; s->ly = 0;
         s->rx = a[2]; s->ry = a[3];
-        if (!s->rx && !s->ry && (a[0] || a[1])) {
+        if (!s->rx && !s->ry && (a[0] || a[1]) && dm_joycon_count() == 0) {
             if (g_hold_type == 1) { s->rx = -a[1]; s->ry = a[0]; }
             else { s->rx = a[0]; s->ry = a[1]; }
         }
