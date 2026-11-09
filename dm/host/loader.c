@@ -765,6 +765,174 @@ static void map_image(module_t *m, const char *dir) {
     m->base = (uint8_t *)base; install_key_page(m);
 }
 #else
+#include <stdatomic.h>
+#include <libkern/OSCacheControl.h>
+
+// ---- Super Mario Odyssey (main=b424be150a8e7d78701cbe7a439d9ebf, 1.3.0 / 1.4.1) internal render resolution ----
+// Docked canvas, swapchain textures, and window crop are scaled up to the RomFS overlay's top step (2560x1440 in
+// SystemData/ProjectGraphicsQuality.szs), with the render target pool (160 MiB), its heap (230 MiB), the game's memory
+// heap (0xc6c00000) and root arena (0xc4800000) grown to match. The 3D scene resolution picker (main+0x5efc20) is hooked
+// by odyssey_scene_pick so the 3D scene resolution can be switched live in-game between 1600x900, 1920x1080, 2240x1260
+// and 2560x1440 via Key 1 (or DM_RENDER_RES at launch).
+static _Atomic uint64_t g_odyssey_scene_cap;   // (uint64_t)h << 32 | w; 0 = uncapped up to g_odyssey_canvas
+static _Atomic uint64_t g_odyssey_scene_cur;   // last (w, h) chosen by odyssey_scene_pick
+static unsigned g_odyssey_canvas_w, g_odyssey_canvas_h;
+
+static void odyssey_scene_pick(const int32_t *limit, int32_t *out, const int32_t *want) {
+    uint64_t cap = atomic_load_explicit(&g_odyssey_scene_cap, memory_order_relaxed);
+    int32_t cw = (int32_t)(cap & 0xffffffffu), ch = (int32_t)(cap >> 32);
+    int32_t w = want[0] < limit[0] ? want[0] : limit[0];
+    int32_t h = want[1] < limit[1] ? want[1] : limit[1];
+    if (cw > 0 && w > cw) w = cw;
+    if (ch > 0 && h > ch) h = ch;
+    out[0] = w;
+    out[1] = h;
+    uint64_t cur = ((uint64_t)(uint32_t)h << 32) | (uint32_t)w;
+    uint64_t prev = atomic_exchange_explicit(&g_odyssey_scene_cur, cur, memory_order_relaxed);
+    if (cur != prev)
+        LOG("odyssey: 3D scene resolution %dx%d (want %dx%d, limit %dx%d, cap %dx%d)",
+            w, h, want[0], want[1], limit[0], limit[1], cw, ch);
+}
+
+int dm_odyssey_scene_res_set(unsigned w, unsigned h) {
+    if (!g_odyssey_canvas_w || w < 640 || h < 360 || w > g_odyssey_canvas_w || h > g_odyssey_canvas_h || (w & 1) || (h & 1))
+        return 0;
+    atomic_store_explicit(&g_odyssey_scene_cap, ((uint64_t)h << 32) | w, memory_order_relaxed);
+    char buf[32]; snprintf(buf, sizeof buf, "%ux%u", w, h);
+    setenv("DM_RENDER_RES", buf, 1);
+    LOG("odyssey: 3D scene resolution cap set to %ux%u (canvas %ux%u)", w, h, g_odyssey_canvas_w, g_odyssey_canvas_h);
+    return 1;
+}
+
+void dm_odyssey_scene_res_get(unsigned *cap_w, unsigned *cap_h, unsigned *cur_w, unsigned *cur_h, unsigned *max_w, unsigned *max_h) {
+    uint64_t cap = atomic_load_explicit(&g_odyssey_scene_cap, memory_order_relaxed);
+    uint64_t cur = atomic_load_explicit(&g_odyssey_scene_cur, memory_order_relaxed);
+    if (cap_w) *cap_w = (unsigned)(cap & 0xffffffffu) ?: (g_odyssey_canvas_w ?: 1600);
+    if (cap_h) *cap_h = (unsigned)(cap >> 32) ?: (g_odyssey_canvas_h ?: 900);
+    if (cur_w) *cur_w = (unsigned)(cur & 0xffffffffu) ?: (cap_w ? *cap_w : 1600);
+    if (cur_h) *cur_h = (unsigned)(cur >> 32) ?: (cap_h ? *cap_h : 900);
+    if (max_w) *max_w = g_odyssey_canvas_w ?: 1600;
+    if (max_h) *max_h = g_odyssey_canvas_h ?: 900;
+}
+
+static void patch_module_code(module_t *m, const char *dir) {
+    if (strcmp(m->name, "main") || strcmp(m->build_id, "b424be150a8e7d78701cbe7a439d9ebf"))
+        return;
+    const char *env = getenv("DM_RENDER_RES");
+    if (env && (!strcasecmp(env, "off") || !strcmp(env, "0"))) {
+        LOG("odyssey: DM_RENDER_RES=%s, keeping shipped 1600x900 render size", env);
+        return;
+    }
+    // Locate the RomFS overlay containing SystemData/ProjectGraphicsQuality.szs so code sizes and the quality table agree
+    char overlay[1024] = "";
+    const char *ov_env = getenv("DM_ROMFS_OVERLAY");
+    if (ov_env && *ov_env) {
+        strlcpy(overlay, ov_env, sizeof overlay);
+    } else {
+        const char *cands[3] = {"/romfs_overlay", "/../dm/romfs_overlay", "/../romfs_overlay"};
+        for (int i = 0; i < 3; i++) {
+            char cand[1024], szs[1100];
+            snprintf(cand, sizeof cand, "%s%s", dir, cands[i]);
+            snprintf(szs, sizeof szs, "%s/SystemData/ProjectGraphicsQuality.szs", cand);
+            if (!access(szs, R_OK)) {
+                strlcpy(overlay, cand, sizeof overlay);
+                setenv("DM_ROMFS_OVERLAY", overlay, 1);
+                break;
+            }
+        }
+    }
+    char szs_check[1100];
+    snprintf(szs_check, sizeof szs_check, "%s/SystemData/ProjectGraphicsQuality.szs", overlay);
+    if (!overlay[0] || access(szs_check, R_OK)) {
+        LOG("[RED] odyssey: %s not found; keeping shipped 1600x900 render size", szs_check);
+        return;
+    }
+    unsigned max_w = 2560, max_h = 1440;
+    char res_path[1100]; snprintf(res_path, sizeof res_path, "%s/render-res.txt", overlay);
+    FILE *rf = fopen(res_path, "r");
+    if (rf) {
+        unsigned rw = 0, rh = 0;
+        if (fscanf(rf, "%ux%u", &rw, &rh) == 2 && rw >= 1600 && rh >= 900 && !(rw & 1) && !(rh & 1)) {
+            max_w = rw; max_h = rh;
+        }
+        fclose(rf);
+    }
+    unsigned cap_w = max_w, cap_h = max_h;
+    if (env && *env) {
+        unsigned ew = 0, eh = 0;
+        if (sscanf(env, "%ux%u", &ew, &eh) == 2 && ew >= 640 && eh >= 360 && ew <= max_w && eh <= max_h && !(ew & 1) && !(eh & 1)) {
+            cap_w = ew; cap_h = eh;
+        } else {
+            LOG("[RED] odyssey: invalid DM_RENDER_RES=%s, using %ux%u", env, max_w, max_h);
+        }
+    }
+    // 1. Verify and patch docked canvas, swapchain texture size, and window crop (6 instructions)
+    struct { size_t off; uint32_t orig, patched; } res_sites[6] = {
+        {0x4bf2a4, 0xd280c809u, 0xd2800009u | (max_w << 5)},   // mov  x9, #w
+        {0x4bf2a8, 0xf2c07089u, 0xf2c00009u | (max_h << 5)},   // movk x9, #h, lsl #32
+        {0x4bf34c, 0x5280c804u, 0x52800004u | (max_w << 5)},   // mov  w4, #w
+        {0x4bf350, 0x52807085u, 0x52800005u | (max_h << 5)},   // mov  w5, #h
+        {0x4e27bc, 0x5280c803u, 0x52800003u | (max_w << 5)},   // mov  w3, #w
+        {0x4e27c0, 0x52807084u, 0x52800004u | (max_h << 5)},   // mov  w4, #h
+    };
+    for (int i = 0; i < 6; i++) {
+        uint32_t cur = *(const uint32_t *)(m->base + res_sites[i].off);
+        if (cur != res_sites[i].orig) {
+            LOG("[RED] odyssey: unexpected instruction at main+%#zx (%#x != %#x); skipping render res patch",
+                res_sites[i].off, cur, res_sites[i].orig);
+            return;
+        }
+    }
+    // 2. Verify and patch render target pool, RT heap, memory heap, and root arena (4 instructions)
+    uint64_t scale = ((uint64_t)max_w * max_h * 0x6400000ull + (1600ull * 900 - 1)) / (1600ull * 900);
+    uint32_t pool = (uint32_t)((scale + 0xfffffull) & ~0xfffffull);
+    if (pool < 0x6400000u) pool = 0x6400000u;
+    uint32_t grow = pool - 0x6400000u;
+    uint32_t heap = 0xaa00000u + grow;
+    uint32_t memheap = 0xc3000000u + grow;
+    uint32_t arena = 0xc0c00000u + grow;
+    struct { size_t off; uint32_t orig, patched; } mem_sites[4] = {
+        {0x624b4c, 0x52a15400u, 0x52a00000u | ((heap >> 16) << 5) | 0},
+        {0x624b7c, 0x52a0c808u, 0x52a00000u | ((pool >> 16) << 5) | 8},
+        {0x4e321c, 0x52b86000u, 0x52a00000u | ((memheap >> 16) << 5) | 0},
+        {0x4bf714, 0x52b81808u, 0x52a00000u | ((arena >> 16) << 5) | 8},
+    };
+    for (int i = 0; i < 4; i++) {
+        uint32_t cur = *(const uint32_t *)(m->base + mem_sites[i].off);
+        if (cur != mem_sites[i].orig) {
+            LOG("[RED] odyssey: unexpected instruction at main+%#zx (%#x != %#x); skipping render res patch",
+                mem_sites[i].off, cur, mem_sites[i].orig);
+            return;
+        }
+    }
+    // 3. Verify 3D scene resolution pick leaf function at main+0x5efc20 (11 instructions)
+    static const uint32_t pick_orig[11] = {
+        0xb9400048u, 0xb9400009u, 0x6b09011fu, 0x1a89b108u, 0xb9000028u,
+        0xb9400448u, 0xb9400409u, 0x6b09011fu, 0x1a89b108u, 0xb9000428u, 0xd65f03c0u,
+    };
+    uint32_t *pick_p = (uint32_t *)(m->base + 0x5efc20);
+    for (int i = 0; i < 11; i++) {
+        if (pick_p[i] != pick_orig[i]) {
+            LOG("[RED] odyssey: unexpected instruction at main+%#x (%#x != %#x); skipping render res patch",
+                0x5efc20 + i * 4, pick_p[i], pick_orig[i]);
+            return;
+        }
+    }
+    // Apply all patches
+    for (int i = 0; i < 6; i++) *(uint32_t *)(m->base + res_sites[i].off) = res_sites[i].patched;
+    for (int i = 0; i < 4; i++) *(uint32_t *)(m->base + mem_sites[i].off) = mem_sites[i].patched;
+    uint64_t target = (uint64_t)(uintptr_t)&odyssey_scene_pick;
+    pick_p[0] = 0x58000050u;   // ldr x16, #8
+    pick_p[1] = 0xd61f0200u;   // br  x16
+    memcpy(&pick_p[2], &target, sizeof target);
+    g_odyssey_canvas_w = max_w;
+    g_odyssey_canvas_h = max_h;
+    atomic_store_explicit(&g_odyssey_scene_cap, ((uint64_t)cap_h << 32) | cap_w, memory_order_relaxed);
+    sys_icache_invalidate(m->base, m->text_end);
+    LOG("odyssey: docked canvas %ux%u, initial 3D scene cap %ux%u, RT pool %u MiB (heap %u MiB, memheap %#x, overlay %s)",
+        max_w, max_h, cap_w, cap_h, pool >> 20, heap >> 20, memheap, overlay);
+}
+
 static uint8_t *slurp(const char *path, size_t *n) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) die("open %s", path);
@@ -791,7 +959,7 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
-        free(raw); install_key_page(m);
+        free(raw); install_key_page(m); patch_module_code(m, dir);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
@@ -803,7 +971,7 @@ static void map_image(module_t *m, const char *dir) {
     uint8_t *slot = jit_slot(m, m->size, 0);
     m->base = mmap(slot, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); patch_module_code(m, dir);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;

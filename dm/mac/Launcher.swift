@@ -26,10 +26,17 @@ struct LauncherView: View {
         self.fit = fit
     }
 
+    private var rawAppIcon: NSImage {
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"), let img = NSImage(contentsOf: url) {
+            return img
+        }
+        return NSApp.applicationIconImage
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
+                Image(nsImage: rawAppIcon).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(info("CFBundleName") ?? "Game").font(.title2.weight(.semibold))
                     Text("Version \(info("CFBundleShortVersionString") ?? "1.0")").foregroundStyle(.secondary)
@@ -488,6 +495,13 @@ public func dmMacLauncher() -> Int32 {
     let model = LauncherModel(file.settings)
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
+    if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"), let icon = NSImage(contentsOf: iconURL) {
+        app.applicationIconImage = icon
+        let iv = NSImageView(image: icon)
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        app.dockTile.contentView = iv
+        app.dockTile.display()
+    }
     app.delegate = launcher
     fputs("launcher: \(file.settings.count) settings shown\n", stderr)
     app.run()

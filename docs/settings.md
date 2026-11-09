@@ -31,6 +31,10 @@ On a Mac, a game checked at that speed (Fire Emblem Fortune's Weave, Mario & Lui
 
 The size of the 3D picture, from 50 to 100 %. Below 100 % the size is fixed there and the game's own dynamic resolution is off; 100 % keeps the game's own. Lower can be lighter on the GPU but is blurrier; the HUD and text keep their sharpness. Only games the app can scale offer it.
 
+### Render resolution
+
+Super Mario Odyssey internal 3D scene resolution (`DM_RENDER_RES`): **1600 × 900** (original Switch docked), **1920 × 1080**, **2240 × 1260** or **2560 × 1440** (default on Mac). Press **1** in-game to switch between resolutions live.
+
 ### Console mode
 
 **Docked** renders at the Switch's TV resolution, **Handheld** at its lower handheld resolution, which is lighter on the phone and can give a higher frame rate.
