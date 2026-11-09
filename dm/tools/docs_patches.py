@@ -83,6 +83,8 @@ HOST_BINDING = [
     ('k_nier_dr', '', '', {'what': "NieR's frame interval and dynamic-resolution floor at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
      'checked': "both releases' mains, where these rows were found",
      'why': "the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' addresses"}),
+    ('', '', 'b424be150a8e7d78701cbe7a439d9ebf', {'what': "Super Mario Odyssey's render resolution patches at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': "Super Mario Odyssey 1.4.1 render resolution and dynamic resolution table patches"}),
 ]
 # Translator rules keyed by one shader's code hash: (the start of the rule's comment, entry)
 SHADER_BINDING = [

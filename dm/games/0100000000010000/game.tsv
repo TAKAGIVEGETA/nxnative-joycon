@@ -22,10 +22,10 @@ romfs_marker	SoundData/SeResourceStd2nd.aras
 zip_store	.aras:.bfsar:.bfstm:.mp4:.szs:.metallib
 
 # ---- Memory ----
-mem_reserve	0x100000000
+mem_reserve	0x140000000
 mem_alias	0x10000000
 mem_stack	0x10000000
-app_pool	0xCD500000
+app_pool	0xD7100000
 
 # ---- Shader split ----
 shader_groups	/ObjectData/=objectdata /StageData/=stagedata /SoundData/=sounddata /LayoutData/=layoutdata /LocalizedData/=localizeddata /EventData/=eventdata /MovieData/=moviedata /SystemData/=systemdata /ShaderData/=shaderdata /EffectData/=effectdata

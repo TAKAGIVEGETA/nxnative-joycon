@@ -1358,6 +1358,183 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+extern int dm_odyssey_scene_res_set(unsigned w, unsigned h);
+extern void dm_odyssey_scene_res_get(unsigned *cap_w, unsigned *cap_h, unsigned *cur_w, unsigned *cur_h, unsigned *max_w, unsigned *max_h);
+extern int dm_gx_get_upscale(void);
+extern void dm_gx_set_upscale(int v);
+
+@interface DmGraphicsPanel : NSObject <NSWindowDelegate>
+@property (nonatomic, readonly) NSPanel *panel;
+- (void)toggle;
+- (void)show;
+- (void)hide;
+- (BOOL)isVisible;
+@end
+
+static DmGraphicsPanel *g_gfx_panel;
+
+@implementation DmGraphicsPanel {
+    NSPanel *_panel;
+    NSSegmentedControl *_resSeg;
+    NSTextField *_statusLabel;
+    NSSegmentedControl *_upscaleSeg;
+    NSTimer *_timer;
+}
+
+- (NSPanel *)panel { return _panel; }
+- (BOOL)isVisible { return _panel && _panel.isVisible; }
+
+static NSTextField *gfx_make_label(NSString *text, NSRect frame, NSFont *font, NSColor *color, NSTextAlignment align) {
+    NSTextField *tf = [[NSTextField alloc] initWithFrame:frame];
+    tf.stringValue = text;
+    tf.bezeled = NO;
+    tf.drawsBackground = NO;
+    tf.editable = NO;
+    tf.selectable = NO;
+    tf.font = font;
+    tf.textColor = color;
+    tf.alignment = align;
+    return tf;
+}
+
+- (void)makePanel {
+    NSRect frame = NSMakeRect(0, 0, 480, 248);
+    _panel = [[NSPanel alloc] initWithContentRect:frame
+                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskNonactivatingPanel
+                                          backing:NSBackingStoreBuffered defer:NO];
+    _panel.title = @"Resolution & Upscaling Live Menu (Key 1)";
+    _panel.releasedWhenClosed = NO;
+    _panel.floatingPanel = YES;
+    _panel.becomesKeyOnlyIfNeeded = YES;
+    _panel.hidesOnDeactivate = YES;
+    _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;
+    _panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    _panel.backgroundColor = [NSColor colorWithCalibratedRed:0.11 green:0.14 blue:0.18 alpha:0.94];
+    _panel.opaque = NO;
+    _panel.delegate = self;
+
+    NSView *cv = [[NSView alloc] initWithFrame:frame];
+    cv.autoresizesSubviews = NO;
+    _panel.contentView = cv;
+
+    NSFont *rowFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    NSColor *rowColor = [NSColor colorWithWhite:0.95 alpha:1.0];
+
+    [cv addSubview:gfx_make_label(@"3D Scene Resolution", NSMakeRect(20, 212, 440, 20), rowFont, rowColor, NSTextAlignmentLeft)];
+    _resSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"1600×900", @"1920×1080", @"2240×1260", @"2560×1440"]
+                                                trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                      target:self action:@selector(resChanged:)];
+    _resSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    _resSeg.selectedSegmentBezelColor = NSColor.controlAccentColor;
+    _resSeg.frame = NSMakeRect(20, 180, 440, 28);
+    [cv addSubview:_resSeg];
+
+    _statusLabel = gfx_make_label(@"", NSMakeRect(20, 154, 440, 18),
+                                  [NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightMedium],
+                                  [NSColor colorWithCalibratedRed:0.65 green:0.86 blue:1.0 alpha:1.0],
+                                  NSTextAlignmentLeft);
+    [cv addSubview:_statusLabel];
+
+    [cv addSubview:gfx_make_label(@"Upscaling (Present)", NSMakeRect(20, 122, 440, 20), rowFont, rowColor, NSTextAlignmentLeft)];
+    _upscaleSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Standard (Bilinear)", @"MetalFX Spatial"]
+                                                    trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                          target:self action:@selector(upscaleChanged:)];
+    _upscaleSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    _upscaleSeg.selectedSegmentBezelColor = NSColor.controlAccentColor;
+    _upscaleSeg.frame = NSMakeRect(20, 90, 440, 28);
+    [cv addSubview:_upscaleSeg];
+
+    NSButton *origBtn = [NSButton buttonWithTitle:@"Original (1600×900 + Standard)" target:self action:@selector(setOrig:)];
+    origBtn.frame = NSMakeRect(20, 42, 212, 30);
+    [cv addSubview:origBtn];
+
+    NSButton *maxBtn = [NSButton buttonWithTitle:@"Max (2560×1440 + MetalFX)" target:self action:@selector(setMax:)];
+    maxBtn.frame = NSMakeRect(248, 42, 212, 30);
+    [cv addSubview:maxBtn];
+
+    [cv addSubview:gfx_make_label(@"Press 1 or Esc at any time to show / hide this live menu",
+                                  NSMakeRect(20, 12, 440, 16),
+                                  [NSFont systemFontOfSize:11],
+                                  [NSColor colorWithWhite:0.65 alpha:1.0],
+                                  NSTextAlignmentCenter)];
+
+    if (g_win) {
+        NSRect wf = g_win.frame;
+        [_panel setFrameTopLeftPoint:NSMakePoint(NSMinX(wf) + 24, NSMaxY(wf) - 38)];
+    } else {
+        [_panel center];
+    }
+}
+
+- (void)refresh {
+    if (!_panel) return;
+    unsigned capW = 1600, capH = 900, curW = 1600, curH = 900, maxW = 1600, maxH = 900;
+    dm_odyssey_scene_res_get(&capW, &capH, &curW, &curH, &maxW, &maxH);
+    NSInteger resSel = capW >= 2560 ? 3 : capW >= 2240 ? 2 : capW >= 1920 ? 1 : 0;
+    _resSeg.selectedSegment = resSel;
+    _statusLabel.stringValue = [NSString stringWithFormat:@"Active 3D Scene: %u × %u   •   Docked Canvas / UI: %u × %u", curW, curH, maxW, maxH];
+    _upscaleSeg.selectedSegment = dm_gx_get_upscale() ? 1 : 0;
+}
+
+- (void)resChanged:(NSSegmentedControl *)s {
+    static const unsigned dims[4][2] = {{1600, 900}, {1920, 1080}, {2240, 1260}, {2560, 1440}};
+    NSInteger idx = s.selectedSegment;
+    if (idx >= 0 && idx < 4) dm_odyssey_scene_res_set(dims[idx][0], dims[idx][1]);
+    [self refresh];
+}
+
+- (void)upscaleChanged:(NSSegmentedControl *)s {
+    dm_gx_set_upscale((int)s.selectedSegment);
+    [self refresh];
+}
+
+- (void)setOrig:(id)sender {
+    (void)sender;
+    dm_odyssey_scene_res_set(1600, 900);
+    dm_gx_set_upscale(0);
+    [self refresh];
+}
+
+- (void)setMax:(id)sender {
+    (void)sender;
+    dm_odyssey_scene_res_set(2560, 1440);
+    dm_gx_set_upscale(1);
+    [self refresh];
+}
+
+- (void)show {
+    if (!_panel) [self makePanel];
+    [self refresh];
+    if (!_timer) {
+        __weak DmGraphicsPanel *weakSelf = self;
+        _timer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; [weakSelf refresh]; }];
+    }
+    [NSCursor setHiddenUntilMouseMoves:NO];
+    [_panel orderFront:nil];
+}
+
+- (void)hide {
+    [_timer invalidate];
+    _timer = nil;
+    if (_panel) [_panel orderOut:nil];
+}
+
+- (void)toggle {
+    if (self.isVisible) [self hide];
+    else [self show];
+}
+
+- (BOOL)windowShouldClose:(NSWindow *)w {
+    if (w != _panel) return YES;
+    [self hide];
+    return NO;
+}
+@end
+static void gfx_panel_toggle(void) {
+    if (!g_gfx_panel) g_gfx_panel = [DmGraphicsPanel new];
+    [g_gfx_panel toggle];
+}
+
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1365,6 +1542,17 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        NSURL *iconURL = [NSBundle.mainBundle URLForResource:@"AppIcon" withExtension:@"icns"];
+        if (iconURL) {
+            NSImage *icon = [[NSImage alloc] initWithContentsOfURL:iconURL];
+            if (icon) {
+                NSApp.applicationIconImage = icon;
+                NSImageView *iv = [NSImageView imageViewWithImage:icon];
+                iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+                NSApp.dockTile.contentView = iv;
+                [NSApp.dockTile display];
+            }
+        }
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
@@ -1418,6 +1606,10 @@ void front_run(void (*guest)(void)) {
         [g_ctrl_menu menuNeedsUpdate:ctm];
         [[bar addItemWithTitle:@"Controllers" action:nil keyEquivalent:@""] setSubmenu:ctm];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
+        if (!g_gfx_panel) g_gfx_panel = [DmGraphicsPanel new];
+        NSMenuItem *gfxItem = [wm addItemWithTitle:@"Graphics Filter Live Menu (Key 1)" action:@selector(toggle) keyEquivalent:@""];
+        gfxItem.target = g_gfx_panel;
+        [wm addItem:[NSMenuItem separatorItem]];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
@@ -1454,6 +1646,16 @@ void front_run(void (*guest)(void)) {
         dm_haptics_apple_init();
         pads_start();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
+            if (e.type == NSEventTypeKeyDown && !e.isARepeat && !(e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption))) {
+                if (e.keyCode == 18 && (e.window == win || (g_gfx_panel && e.window == g_gfx_panel.panel))) {
+                    gfx_panel_toggle();
+                    return nil;
+                }
+                if (e.keyCode == 53 && g_gfx_panel && g_gfx_panel.isVisible) {
+                    [g_gfx_panel hide];
+                    return nil;
+                }
+            }
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
             if (e.type == NSEventTypeKeyDown && fn_shortcut(e)) return e;   // fn (Globe) + a letter is the system's (fn+F full screen, GitHub issue #873), not the game's F

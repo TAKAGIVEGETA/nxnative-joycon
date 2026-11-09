@@ -100,7 +100,10 @@ def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and th
              '-o', out, *swift_sources(), *objs, '-framework', 'CoreFoundation', '-framework', 'AppKit', '-framework', 'SwiftUI', '-framework', 'IOKit'])
 
 
-def make_icns(jpg, out):   # the game's icon (256x256 JPEG) at every size an .icns holds
+def make_icns(jpg, out):   # the game's icon (256x256 JPEG, or a ready-made .icns) at every size an .icns holds
+    if str(jpg).lower().endswith('.icns'):
+        shutil.copyfile(jpg, out)
+        return
     with tempfile.TemporaryDirectory(dir=out.parent) as t:
         s = Path(t) / 'AppIcon.iconset'; s.mkdir()
         for n in ICON_SIZES:
@@ -322,6 +325,8 @@ def pack(a):
     if fonts: copy(fonts, dm / 'font', False)
     if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
     if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
+    ov_script = HERE.parent / 'games' / a.title_id.upper() / 'make_render_res_overlay.py'
+    if ov_script.is_file(): run([sys.executable, ov_script, romfs, dm / 'romfs_overlay', '2560x1440'])
     step('shader libraries'); msl_dst = res / 'msl' / (a.msl_name or msl.name); msl_dst.parent.mkdir(exist_ok=True); copy_msl(msl, msls, msl_dst, clone['msl'])
     if aoc: step('add-on content'); copy([aoc], res / 'aoc', clone['aoc'])
     if pso: step('pipeline archive'); (res / 'pso').mkdir(); copy(pso, res / 'pso', clone['pso'])
