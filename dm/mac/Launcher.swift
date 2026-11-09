@@ -8,20 +8,23 @@ import AppKit
 import QuartzCore
 import SwiftUI
 import IOKit.hid
+import GameController
 
 private func info(_ key: String) -> String? { Bundle.main.object(forInfoDictionaryKey: key) as? String }
 
 struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     @ObservedObject var joyConMonitor: JoyConMonitor
+    @ObservedObject var gyroCalibrator: GamepadGyroCalibrator
     let done: (Bool) -> Void
     let fit: (CGFloat) -> Void
     @AppStorage("window.show") private var show = true
     @AppStorage("window.advanced") private var advanced = false
 
-    init(m: LauncherModel, joyConMonitor: JoyConMonitor = .shared, done: @escaping (Bool) -> Void, fit: @escaping (CGFloat) -> Void) {
+    init(m: LauncherModel, joyConMonitor: JoyConMonitor = .shared, gyroCalibrator: GamepadGyroCalibrator = .shared, done: @escaping (Bool) -> Void, fit: @escaping (CGFloat) -> Void) {
         self.m = m
         self.joyConMonitor = joyConMonitor
+        self.gyroCalibrator = gyroCalibrator
         self.done = done
         self.fit = fit
     }
@@ -48,6 +51,7 @@ struct LauncherView: View {
                 settingSections(basic: true)
                 CloudSavesSection()
                 JoyConSection(monitor: joyConMonitor)
+                GyroCalSection(calibrator: gyroCalibrator)
                 Section {
                     DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
                 }
@@ -250,6 +254,396 @@ struct JoyConSection: View {
     }
 }
 
+enum GyroCalPhase: Equatable {
+    case idle
+    case countdown
+    case sampling
+    case done
+    case moved
+    case noData
+}
+
+struct GyroCalSection: View {
+    @ObservedObject var calibrator: GamepadGyroCalibrator
+
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: "gyroscope")
+                    Text("Gyroscope Calibration (Standard Controller)")
+                        .font(.headline)
+                    Spacer()
+                    if let ctrl = calibrator.connectedControllerName {
+                        Text(ctrl).font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("No motion controller connected").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack {
+                    statusView
+                    Spacer()
+                }
+
+                HStack(spacing: 12) {
+                    Button(calibrating ? "Calibrating..." : "Calibrate (5s countdown)") {
+                        calibrator.startCalibration()
+                    }
+                    .disabled(calibrating)
+
+                    if calibrator.biasDeg != nil {
+                        Button("Clear Calibration", role: .destructive) {
+                            calibrator.clearCalibration()
+                        }
+                        .disabled(calibrating)
+                    }
+                }
+                .padding(.top, 2)
+            }
+            .padding(.vertical, 4)
+        } header: {
+            Text("Gamepad Calibration")
+        } footer: {
+            Text("Calibrates DualSense, DualShock 4, Switch Pro, 8BitDo, and other standard gamepads. Leave the controller completely still on a flat surface during the 5s countdown and 3s sampling. The measured bias is saved and subtracted in game to eliminate drift. Joy-Con uses its factory SPI calibration and is not affected.")
+        }
+    }
+
+    private var calibrating: Bool {
+        calibrator.phase == .countdown || calibrator.phase == .sampling
+    }
+
+    @ViewBuilder
+    private var statusView: some View {
+        switch calibrator.phase {
+        case .countdown:
+            Text(String(format: "Countdown: %d s (keep controller still on a flat surface…)", Int(ceil(calibrator.secondsLeft))))
+                .foregroundColor(.yellow)
+                .font(.callout.monospacedDigit())
+        case .sampling:
+            Text(String(format: "Sampling gyro bias (%.1f s remaining, do not touch)…", calibrator.secondsLeft))
+                .foregroundColor(.cyan)
+                .font(.callout.monospacedDigit())
+        case .done:
+            Text("Calibration complete and saved")
+                .foregroundColor(.green)
+                .font(.callout)
+        case .moved:
+            Text("Calibration failed: controller moved, please retry")
+                .foregroundColor(.red)
+                .font(.callout)
+        case .noData:
+            Text("Calibration failed: no gyroscope data received")
+                .foregroundColor(.red)
+                .font(.callout)
+        case .idle:
+            if let b = calibrator.biasDeg {
+                let total = sqrt(b.0 * b.0 + b.1 * b.1 + b.2 * b.2)
+                Text(String(format: "Calibrated (bias: %.2f°/s  [%+.2f, %+.2f, %+.2f])", total, b.0, b.1, b.2))
+                    .foregroundColor(.green)
+                    .font(.callout.monospacedDigit())
+            } else {
+                Text("Not calibrated (bias: 0.00°/s)")
+                    .foregroundColor(.secondary)
+                    .font(.callout)
+            }
+        }
+    }
+}
+
+final class GamepadGyroCalibrator: ObservableObject {
+    static let shared = GamepadGyroCalibrator()
+
+    @Published var connectedControllerName: String?
+    @Published var phase: GyroCalPhase = .idle
+    @Published var secondsLeft: Double = 0
+    @Published var biasDeg: (Double, Double, Double)?
+
+    private var sampleTimer: Timer?
+    private var countdownTimer: Timer?
+    private var phaseStart: Date = Date()
+    private var samples: [(Double, Double, Double)] = []
+    private var lastSampleTime: TimeInterval = 0
+
+    private var proManager: IOHIDManager?
+    private var proBuffers: [IOHIDDevice: UnsafeMutablePointer<UInt8>] = [:]
+
+    init() {
+        loadSavedBias()
+    }
+
+    func loadSavedBias() {
+        if let s = UserDefaults.standard.string(forKey: "DmGyroBias") ?? UserDefaults.standard.string(forKey: "launcher.DM_GYRO_BIAS") {
+            let parts = s.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if parts.count == 3 {
+                biasDeg = (parts[0], parts[1], parts[2])
+                setenv("DM_GYRO_BIAS", s, 1)
+            }
+        }
+    }
+
+    func start() {
+        loadSavedBias()
+        NotificationCenter.default.addObserver(self, selector: #selector(controllersChanged), name: .GCControllerDidConnect, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(controllersChanged), name: .GCControllerDidDisconnect, object: nil)
+        attachGameControllers()
+        updateControllerName()
+        startProManager()
+    }
+
+    func stop() {
+        NotificationCenter.default.removeObserver(self)
+        detachGameControllers()
+        stopProManager()
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        sampleTimer?.invalidate()
+        sampleTimer = nil
+    }
+
+    @objc private func controllersChanged() {
+        DispatchQueue.main.async {
+            self.attachGameControllers()
+            self.updateControllerName()
+        }
+    }
+
+    private func attachGameControllers() {
+        for c in GCController.controllers() {
+            if let name = c.vendorName, name.localizedCaseInsensitiveContains("Joy-Con") {
+                continue
+            }
+            if let m = c.motion {
+                if m.sensorsRequireManualActivation { m.sensorsActive = true }
+                m.valueChangedHandler = { [weak self] motion in
+                    guard let self = self, self.phase == .sampling else { return }
+                    let rot = motion.rotationRate
+                    if rot.x == 0 && rot.y == 0 && rot.z == 0 { return }
+                    self.onSample(x: rot.x, y: rot.y, z: rot.z)
+                }
+            }
+        }
+    }
+
+    private func detachGameControllers() {
+        for c in GCController.controllers() {
+            c.motion?.valueChangedHandler = nil
+        }
+    }
+
+    private func updateControllerName() {
+        if !proBuffers.isEmpty {
+            connectedControllerName = "Nintendo Switch Pro Controller"
+            return
+        }
+        for c in GCController.controllers() {
+            if let name = c.vendorName, name.localizedCaseInsensitiveContains("Joy-Con") {
+                continue
+            }
+            if c.motion != nil {
+                connectedControllerName = c.vendorName ?? "Gamepad"
+                if let m = c.motion, m.sensorsRequireManualActivation {
+                    m.sensorsActive = true
+                }
+                return
+            }
+        }
+        connectedControllerName = nil
+    }
+
+    private func startProManager() {
+        guard proManager == nil else { return }
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.proManager = mgr
+        let match: [String: Any] = [kIOHIDVendorIDKey: 0x057E, kIOHIDProductIDKey: 0x2009]
+        IOHIDManagerSetDeviceMatching(mgr, match as CFDictionary)
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, { ctx, result, sender, dev in
+            guard let ctx = ctx, result == kIOReturnSuccess else { return }
+            let self_ = Unmanaged<GamepadGyroCalibrator>.fromOpaque(ctx).takeUnretainedValue()
+            self_.proMatched(dev)
+        }, ctx)
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, { ctx, result, sender, dev in
+            guard let ctx = ctx else { return }
+            let self_ = Unmanaged<GamepadGyroCalibrator>.fromOpaque(ctx).takeUnretainedValue()
+            self_.proRemoved(dev)
+        }, ctx)
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        _ = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+    }
+
+    private func stopProManager() {
+        guard let mgr = proManager else { return }
+        IOHIDManagerRegisterDeviceMatchingCallback(mgr, nil, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, nil, nil)
+        IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        self.proManager = nil
+        for (dev, buf) in proBuffers {
+            IOHIDDeviceRegisterInputReportCallback(dev, buf, 512, nil, nil)
+            buf.deallocate()
+        }
+        proBuffers.removeAll()
+    }
+
+    private func proMatched(_ dev: IOHIDDevice) {
+        if let syn = IOHIDDeviceGetProperty(dev, "GCSyntheticDevice" as CFString), CFGetTypeID(syn) == CFBooleanGetTypeID(), CFBooleanGetValue((syn as! CFBoolean)) {
+            return
+        }
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 512)
+        proBuffers[dev] = buf
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        IOHIDDeviceRegisterInputReportCallback(dev, buf, 512, { ctx, result, sender, type, reportId, report, len in
+            guard let ctx = ctx, result == kIOReturnSuccess, reportId == 0x30, len >= 49 else { return }
+            let self_ = Unmanaged<GamepadGyroCalibrator>.fromOpaque(ctx).takeUnretainedValue()
+            let rad = 0.070 * Double.pi / 180.0
+            for k in 0..<3 {
+                let base = 13 + 12 * k
+                let gxRaw = Int16(bitPattern: UInt16(report[base + 6]) | (UInt16(report[base + 7]) << 8))
+                let gyRaw = Int16(bitPattern: UInt16(report[base + 8]) | (UInt16(report[base + 9]) << 8))
+                let gzRaw = Int16(bitPattern: UInt16(report[base + 10]) | (UInt16(report[base + 11]) << 8))
+                let rx = -Double(gyRaw) * rad
+                let ry = Double(gxRaw) * rad
+                let rz = Double(gzRaw) * rad
+                self_.onSample(x: rx, y: ry, z: rz)
+            }
+        }, ctx)
+        DispatchQueue.main.async {
+            self.updateControllerName()
+        }
+    }
+
+    private func proRemoved(_ dev: IOHIDDevice) {
+        if let buf = proBuffers.removeValue(forKey: dev) {
+            IOHIDDeviceRegisterInputReportCallback(dev, buf, 512, nil, nil)
+            buf.deallocate()
+        }
+        DispatchQueue.main.async {
+            self.updateControllerName()
+        }
+    }
+
+    private func onSample(x: Double, y: Double, z: Double) {
+        if phase == .sampling && samples.count < 4096 {
+            lastSampleTime = ProcessInfo.processInfo.systemUptime
+            samples.append((x, y, z))
+        }
+    }
+
+    func startCalibration() {
+        attachGameControllers()
+        updateControllerName()
+        samples.removeAll()
+        phase = .countdown
+        secondsLeft = 5.0
+        phaseStart = Date()
+
+        countdownTimer?.invalidate()
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            let elapsed = Date().timeIntervalSince(self.phaseStart)
+            if self.phase == .countdown {
+                self.secondsLeft = max(0, 5.0 - elapsed)
+                if self.secondsLeft <= 0 {
+                    self.phase = .sampling
+                    self.secondsLeft = 3.0
+                    self.phaseStart = Date()
+                    self.samples.removeAll()
+                    self.startActiveSamplingTimer()
+                }
+            } else if self.phase == .sampling {
+                self.secondsLeft = max(0, 3.0 - elapsed)
+                if self.secondsLeft <= 0 {
+                    t.invalidate()
+                    self.countdownTimer = nil
+                    self.stopActiveSamplingTimer()
+                    self.finishSampling()
+                }
+            }
+        }
+    }
+
+    private func startActiveSamplingTimer() {
+        attachGameControllers()
+        sampleTimer?.invalidate()
+        sampleTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
+            guard let self = self, self.phase == .sampling else { return }
+            if ProcessInfo.processInfo.systemUptime - self.lastSampleTime > 0.035 {
+                for c in GCController.controllers() {
+                    if let name = c.vendorName, name.localizedCaseInsensitiveContains("Joy-Con") {
+                        continue
+                    }
+                    if let m = c.motion {
+                        if m.sensorsRequireManualActivation && !m.sensorsActive { m.sensorsActive = true }
+                        let rot = m.rotationRate
+                        if rot.x == 0 && rot.y == 0 && rot.z == 0 { continue }
+                        self.onSample(x: rot.x, y: rot.y, z: rot.z)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopActiveSamplingTimer() {
+        sampleTimer?.invalidate()
+        sampleTimer = nil
+    }
+
+    private func finishSampling() {
+        let n = samples.count
+        guard n >= 30 else {
+            phase = .noData
+            return
+        }
+        let xs = samples.map { $0.0 }.sorted()
+        let ys = samples.map { $0.1 }.sorted()
+        let zs = samples.map { $0.2 }.sorted()
+        let medX = xs[n / 2], medY = ys[n / 2], medZ = zs[n / 2]
+
+        var inliers: [(Double, Double, Double)] = []
+        for s in samples {
+            let dist = sqrt(pow(s.0 - medX, 2) + pow(s.1 - medY, 2) + pow(s.2 - medZ, 2))
+            if dist <= 0.1 {
+                inliers.append(s)
+            }
+        }
+        let outliers = n - inliers.count
+        guard !inliers.isEmpty && outliers <= max(1, n / 10) else {
+            phase = .moved
+            return
+        }
+        let meanX = inliers.map { $0.0 }.reduce(0, +) / Double(inliers.count)
+        let meanY = inliers.map { $0.1 }.reduce(0, +) / Double(inliers.count)
+        let meanZ = inliers.map { $0.2 }.reduce(0, +) / Double(inliers.count)
+        let normMean = sqrt(meanX * meanX + meanY * meanY + meanZ * meanZ)
+        guard normMean <= 1.05 else {
+            phase = .noData
+            return
+        }
+
+        let b = (meanX * 180.0 / .pi, meanY * 180.0 / .pi, meanZ * 180.0 / .pi)
+        biasDeg = b
+        let val = String(format: "%.6f,%.6f,%.6f", b.0, b.1, b.2)
+        UserDefaults.standard.set(val, forKey: "DmGyroBias")
+        UserDefaults.standard.set(val, forKey: "launcher.DM_GYRO_BIAS")
+        setenv("DM_GYRO_BIAS", val, 1)
+        phase = .done
+        fputs("[gyro] calibrated: bias (\(val)) deg/s\n", stderr)
+    }
+
+    func clearCalibration() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        stopActiveSamplingTimer()
+        biasDeg = nil
+        UserDefaults.standard.removeObject(forKey: "DmGyroBias")
+        UserDefaults.standard.removeObject(forKey: "launcher.DM_GYRO_BIAS")
+        unsetenv("DM_GYRO_BIAS")
+        phase = .idle
+        fputs("[gyro] calibration cleared\n", stderr)
+    }
+}
+
 final class JoyConMonitor: ObservableObject {
     static let shared = JoyConMonitor()
 
@@ -422,6 +816,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
     func applicationDidFinishLaunching(_ n: Notification) {
         JoyConMonitor.shared.start()
+        GamepadGyroCalibrator.shared.start()
         let name = info("CFBundleName") ?? "Game"
         let menu = NSMenu(), item = NSMenuItem(), app = NSMenu()
         app.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
@@ -464,6 +859,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
     func finish(_ play: Bool) {
         JoyConMonitor.shared.stop()
+        GamepadGyroCalibrator.shared.stop()
         guard let w = window else { return }
         window = nil; self.play = play
         // The main thread blocks in launcher.c's waitpid once run() returns, so the window must leave the screen now: no fade-out (it runs on later run-loop passes),

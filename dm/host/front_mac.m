@@ -1507,7 +1507,7 @@ static NSTextField *gfx_make_label(NSString *text, NSRect frame, NSFont *font, N
     [self refresh];
     if (!_timer) {
         __weak DmGraphicsPanel *weakSelf = self;
-        _timer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; [weakSelf refresh]; }];
+        _timer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *t) { (void)t; [weakSelf refresh]; }];
     }
     [NSCursor setHiddenUntilMouseMoves:NO];
     [_panel orderFront:nil];

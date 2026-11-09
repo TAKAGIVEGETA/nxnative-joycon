@@ -657,6 +657,7 @@ static live_motion g_hid_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 .
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
 static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
+static float g_gyro_bias[3]; static int g_gyro_bias_set;
 static void motion_env(void) {
     const char *e = getenv("DM_MOTION"); g_motion_off = e && !atoi(e);
     if (!motion_map_parse(&g_motion_map, getenv("DM_MOTION_AXES"))) LOG("[hid] DM_MOTION_AXES='%s' is not like \"x,-z,y\": using x,y,z", getenv("DM_MOTION_AXES"));
@@ -664,24 +665,39 @@ static void motion_env(void) {
     if ((e = getenv("DM_MOTION_GAIN"))) g_motion_gain = (float)atof(e);
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
+    const char *gb = getenv("DM_GYRO_BIAS");
+    if (gb && strcmp(gb, "0")) {
+        double d[3]; int used = 0;
+        if (sscanf(gb, " %lf , %lf , %lf %n", &d[0], &d[1], &d[2], &used) == 3 && used > 0) {
+            g_gyro_bias[0] = (float)(d[0] * M_PI / 180.0);
+            g_gyro_bias[1] = (float)(d[1] * M_PI / 180.0);
+            g_gyro_bias[2] = (float)(d[2] * M_PI / 180.0);
+            g_gyro_bias_set = 1;
+            LOG("[hid] controller gyro bias applied: (%+.4f %+.4f %+.4f) deg/s (DM_GYRO_BIAS)", d[0], d[1], d[2]);
+        }
+    }
 }
 static void motion_set(int p, int dev, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
     if (p < 0 || p >= DM_PLAYERS || (source == 1 && p) || dev < 0 || dev > 1) return;
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
     static motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
     // Each transport owns its orientation. HID batches carry three sample times; arrival time controls freshness, never their integration intervals.
-    live_motion *m = source == 1 ? &g_phone_motion : source == 2 ? &g_hid_motion[p][dev] : &g_motion[p];
+    live_motion *m = source == 1 ? &g_phone_motion : (source == 2 || source == 3) ? &g_hid_motion[p][dev] : &g_motion[p];
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
     if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
-    motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
+    float r[3] = {rot[0], rot[1], rot[2]};
+    if (g_gyro_bias_set && (source == 0 || source == 2)) {
+        r[0] -= g_gyro_bias[0]; r[1] -= g_gyro_bias[1]; r[2] -= g_gyro_bias[2];
+    }
+    motion_update(&m->st, source ? &identity : &g_motion_map, acc, r, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
         LOG("[hid] motion player 1 dev %d (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
-            dev, source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
+            dev, source == 1 ? "phone" : source == 2 ? "controller HID" : source == 3 ? "Joy-Con HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
     m->last_ns = t; m->received_ns = now;
     pthread_mutex_unlock(&m->mu);
@@ -689,7 +705,7 @@ static void motion_set(int p, int dev, const float acc[3], const float rot[3], i
 void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, 0, acc, rot, 0, 0); }
 void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, 0, acc, rot, 1, 0); }
 void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, 0, acc, rot, 2, t); }
-void dm_motion_set_hid_device(int p, int dev, const float acc[3], const float rot[3], uint64_t t) { if (t && (dev == 0 || dev == 1)) motion_set(p, dev, acc, rot, 2, t); }
+void dm_motion_set_hid_device(int p, int dev, const float acc[3], const float rot[3], uint64_t t) { if (t && (dev == 0 || dev == 1)) motion_set(p, dev, acc, rot, 3, t); }
 void dm_motion_clear(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
     pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; pthread_mutex_unlock(&g_motion[p].mu);
