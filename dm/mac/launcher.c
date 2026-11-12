@@ -150,6 +150,50 @@ static void gyro_bias_choice(void) {
     if (gb) CFRelease(gb);
 }
 
+static void metal_hud_choice(void) {
+    CFStringRef domain = CFBundleGetIdentifier(CFBundleGetMainBundle());
+    if (!domain) return;
+    const char *h = getenv("DM_METAL_HUD");
+    if (h && !strcmp(h, "0")) {
+        setenv("MTL_HUD_ENABLED", "0", 1);
+        unsetenv("MTL_HUD_ELEMENTS");
+        return;
+    }
+    if (!getenv("MTL_HUD_ELEMENTS")) {
+        CFPropertyListRef elem = CFPreferencesCopyAppValue(CFSTR("launcher.MTL_HUD_ELEMENTS"), domain);
+        if (elem && CFGetTypeID(elem) == CFStringGetTypeID()) {
+            char val[128];
+            if (CFStringGetCString(elem, val, sizeof val, kCFStringEncodingUTF8) && *val) {
+                setenv("MTL_HUD_ELEMENTS", val, 0);
+                fprintf(stderr, "launcher: env MTL_HUD_ELEMENTS=%s (saved choice)\n", val);
+            }
+        }
+        if (elem) CFRelease(elem);
+    }
+    if (!getenv("MTL_HUD_ALIGNMENT")) {
+        CFPropertyListRef align = CFPreferencesCopyAppValue(CFSTR("launcher.MTL_HUD_ALIGNMENT"), domain);
+        if (align && CFGetTypeID(align) == CFStringGetTypeID()) {
+            char val[64];
+            if (CFStringGetCString(align, val, sizeof val, kCFStringEncodingUTF8) && *val) {
+                setenv("MTL_HUD_ALIGNMENT", val, 0);
+                fprintf(stderr, "launcher: env MTL_HUD_ALIGNMENT=%s (saved choice)\n", val);
+            }
+        }
+        if (align) CFRelease(align);
+    }
+    if (!getenv("MTL_HUD_SCALE")) {
+        CFPropertyListRef scale = CFPreferencesCopyAppValue(CFSTR("launcher.MTL_HUD_SCALE"), domain);
+        if (scale && CFGetTypeID(scale) == CFStringGetTypeID()) {
+            char val[64];
+            if (CFStringGetCString(scale, val, sizeof val, kCFStringEncodingUTF8) && *val) {
+                setenv("MTL_HUD_SCALE", val, 0);
+                fprintf(stderr, "launcher: env MTL_HUD_SCALE=%s (saved choice)\n", val);
+            }
+        }
+        if (scale) CFRelease(scale);
+    }
+}
+
 // Cloud saves: the folder chosen in the settings window (Launcher.swift CloudSavesSection, cloudSaves.folder in the app's preferences) becomes DM_SAVE_SYNC
 // (dm/host/save_sync.h), with or without the window; a DM_SAVE_SYNC the launch environment or an env file set wins. A front end may write the key too (docs/frontends.md, The cloud saves folder)
 static void cloud_saves_folder(void) {
@@ -222,6 +266,7 @@ int main(int argc, char **argv) {
     if (shown == 2) saved_choices();
     cloud_saves_folder();
     gyro_bias_choice();
+    metal_hud_choice();
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
