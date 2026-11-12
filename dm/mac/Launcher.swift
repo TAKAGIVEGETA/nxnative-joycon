@@ -87,7 +87,13 @@ struct LauncherView: View {
             let rows = m.rows(in: section, basic: basic)
             if !rows.isEmpty {
                 Section(section) {
-                    ForEach(rows) { SettingRow(s: $0, m: m) }
+                    ForEach(rows) { s in
+                        if s.env == "DM_METAL_HUD" {
+                            PerformanceHudRow(s: s, m: m)
+                        } else {
+                            SettingRow(s: s, m: m)
+                        }
+                    }
                 }
             }
         }
@@ -351,6 +357,232 @@ struct GyroCalSection: View {
     }
 }
 
+struct PerformanceHudRow: View {
+    let s: Setting
+    @ObservedObject var m: LauncherModel
+
+    enum HudPreset: String, CaseIterable, Identifiable {
+        case off = "0"
+        case fpsOnly = "fps"
+        case fpsMemory = "fps_memory"
+        case full = "full"
+        case custom = "custom"
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .off: return "Off"
+            case .fpsOnly: return "FPS Only"
+            case .fpsMemory: return "FPS + Memory"
+            case .full: return "Full (Default)"
+            case .custom: return "Custom…"
+            }
+        }
+    }
+
+    @AppStorage("launcher.MTL_HUD_PRESET") private var presetRaw = "0"
+    @AppStorage("launcher.MTL_HUD_ELEMENTS") private var customElements = "fps"
+    @AppStorage("launcher.MTL_HUD_ALIGNMENT") private var alignment = "12"
+    @AppStorage("launcher.MTL_HUD_SCALE") private var scaleStr = "0.117461"
+
+    private var locked: Bool { m.fixed.contains(s.env) || m.fixed.contains("MTL_HUD_ELEMENTS") }
+
+    private var currentPreset: Binding<HudPreset> {
+        Binding(
+            get: {
+                if (m.values["DM_METAL_HUD"] ?? s.def) == "0" {
+                    return .off
+                }
+                return HudPreset(rawValue: presetRaw) ?? .fpsOnly
+            },
+            set: { next in
+                presetRaw = next.rawValue
+                switch next {
+                case .off:
+                    m.values["DM_METAL_HUD"] = "0"
+                case .fpsOnly:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "fps"
+                    scaleStr = "0.117461"
+                    alignment = "12"
+                case .fpsMemory:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "memory,fps"
+                    scaleStr = "0.147233"
+                    alignment = "12"
+                case .full:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "default"
+                    scaleStr = "0.200000"
+                case .custom:
+                    m.values["DM_METAL_HUD"] = "1"
+                }
+                syncEnv()
+            }
+        )
+    }
+
+    private var scaleBinding: Binding<Double> {
+        Binding(
+            get: { Double(scaleStr) ?? 0.12 },
+            set: {
+                scaleStr = String(format: "%.6f", $0)
+                syncEnv()
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker(selection: currentPreset) {
+                ForEach(HudPreset.allCases) { p in
+                    Text(p.title).tag(p)
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Performance HUD")
+                    if locked {
+                        Text("Set by an env file").font(.footnote).foregroundStyle(.secondary)
+                    } else if currentPreset.wrappedValue == .off {
+                        Text("Shows Apple Metal HUD metrics during gameplay.").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(locked)
+
+            if currentPreset.wrappedValue != .off {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Position").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $alignment) {
+                            Text("Top Right").tag("12")
+                            Text("Top Left").tag("9")
+                            Text("Bottom Right").tag("6")
+                            Text("Bottom Left").tag("3")
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 150)
+                        .onChange(of: alignment) { _, _ in syncEnv() }
+                    }
+
+                    HStack {
+                        Text("Scale").font(.subheadline)
+                        Spacer()
+                        Slider(value: scaleBinding, in: 0.08...0.30, step: 0.01)
+                            .frame(width: 140)
+                        Text(String(format: "%.2f", scaleBinding.wrappedValue))
+                            .font(.caption.monospacedDigit())
+                            .frame(width: 36, alignment: .trailing)
+                    }
+
+                    if currentPreset.wrappedValue == .custom {
+                        HStack {
+                            Text("Elements").font(.subheadline)
+                            Spacer()
+                            TextField("e.g. fps, memory,fps", text: $customElements)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 180)
+                                .onChange(of: customElements) { _, _ in syncEnv() }
+                        }
+                    }
+                }
+                .padding(.leading, 8)
+                .padding(.vertical, 4)
+            }
+        }
+        .onAppear {
+            loadInitialState()
+        }
+    }
+
+    private func loadInitialState() {
+        let env = ProcessInfo.processInfo.environment
+        if let elem = env["MTL_HUD_ELEMENTS"], !elem.isEmpty {
+            customElements = elem
+            if elem == "fps" { presetRaw = "fps" }
+            else if elem == "memory,fps" || elem == "fps,memory" { presetRaw = "fps_memory" }
+            else { presetRaw = "custom" }
+        }
+        if let align = env["MTL_HUD_ALIGNMENT"], !align.isEmpty {
+            alignment = align
+        }
+        if let sc = env["MTL_HUD_SCALE"], !sc.isEmpty {
+            scaleStr = sc
+        }
+        if (m.values["DM_METAL_HUD"] ?? s.def) == "1" && presetRaw == "0" {
+            presetRaw = "fps"
+        }
+        syncEnv()
+    }
+
+    private func syncEnv() {
+        let preset = currentPreset.wrappedValue
+        if preset == .off {
+            m.values["DM_METAL_HUD"] = "0"
+            setenv("DM_METAL_HUD", "0", 1)
+            setenv("MTL_HUD_ENABLED", "0", 1)
+            unsetenv("MTL_HUD_ELEMENTS")
+            unsetenv("MTL_HUD_ALIGNMENT")
+            unsetenv("MTL_HUD_SCALE")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ELEMENTS")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ALIGNMENT")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_SCALE")
+            updateEnvFile(enabled: false)
+        } else {
+            m.values["DM_METAL_HUD"] = "1"
+            setenv("DM_METAL_HUD", "1", 1)
+            setenv("MTL_HUD_ENABLED", "1", 1)
+
+            let elem = (preset == .full) ? "" : customElements
+            if elem.isEmpty || elem == "default" {
+                unsetenv("MTL_HUD_ELEMENTS")
+                UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ELEMENTS")
+            } else {
+                setenv("MTL_HUD_ELEMENTS", elem, 1)
+                UserDefaults.standard.set(elem, forKey: "launcher.MTL_HUD_ELEMENTS")
+            }
+
+            setenv("MTL_HUD_ALIGNMENT", alignment, 1)
+            UserDefaults.standard.set(alignment, forKey: "launcher.MTL_HUD_ALIGNMENT")
+
+            setenv("MTL_HUD_SCALE", scaleStr, 1)
+            UserDefaults.standard.set(scaleStr, forKey: "launcher.MTL_HUD_SCALE")
+
+            updateEnvFile(enabled: true, elements: elem, alignment: alignment, scale: scaleStr)
+        }
+    }
+
+    private func updateEnvFile(enabled: Bool, elements: String = "", alignment: String = "12", scale: String = "0.117461") {
+        guard let home = ProcessInfo.processInfo.environment["HOME"] else { return }
+        let titleId = (Bundle.main.object(forInfoDictionaryKey: "DMTitleID") as? String) ?? "0100000000010000"
+        let envPath = "\(home)/Library/Application Support/nxnative/\(titleId)/env.txt"
+        var lines: [String] = []
+        if let content = try? String(contentsOfFile: envPath, encoding: .utf8) {
+            lines = content.components(separatedBy: "\n").filter { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                return !t.hasPrefix("DM_METAL_HUD=") && !t.hasPrefix("MTL_HUD_ENABLED=") &&
+                       !t.hasPrefix("MTL_HUD_ELEMENTS=") && !t.hasPrefix("MTL_HUD_ALIGNMENT=") &&
+                       !t.hasPrefix("MTL_HUD_SCALE=")
+            }
+        }
+        if enabled {
+            lines.append("DM_METAL_HUD=1")
+            lines.append("MTL_HUD_ENABLED=1")
+            if !elements.isEmpty && elements != "default" {
+                lines.append("MTL_HUD_ELEMENTS=\(elements)")
+            }
+            lines.append("MTL_HUD_ALIGNMENT=\(alignment)")
+            lines.append("MTL_HUD_SCALE=\(scale)")
+        } else {
+            lines.append("DM_METAL_HUD=0")
+        }
+        let newContent = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.joined(separator: "\n") + "\n"
+        try? newContent.write(toFile: envPath, atomically: true, encoding: .utf8)
+    }
+}
+
 final class GamepadGyroCalibrator: ObservableObject {
     static let shared = GamepadGyroCalibrator()
 
@@ -373,7 +605,24 @@ final class GamepadGyroCalibrator: ObservableObject {
     }
 
     func loadSavedBias() {
-        if let s = UserDefaults.standard.string(forKey: "DmGyroBias") ?? UserDefaults.standard.string(forKey: "launcher.DM_GYRO_BIAS") {
+        var s = UserDefaults.standard.string(forKey: "DmGyroBias") ?? UserDefaults.standard.string(forKey: "launcher.DM_GYRO_BIAS")
+        if (s == nil || s!.isEmpty), let envVal = ProcessInfo.processInfo.environment["DM_GYRO_BIAS"], !envVal.isEmpty {
+            s = envVal
+        }
+        if s == nil, let home = ProcessInfo.processInfo.environment["HOME"] {
+            let titleId = (Bundle.main.object(forInfoDictionaryKey: "DMTitleID") as? String) ?? "0100000000010000"
+            let envPath = "\(home)/Library/Application Support/nxnative/\(titleId)/env.txt"
+            if let content = try? String(contentsOfFile: envPath, encoding: .utf8) {
+                for line in content.components(separatedBy: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.hasPrefix("DM_GYRO_BIAS=") {
+                        s = String(trimmed.dropFirst("DM_GYRO_BIAS=".count))
+                        break
+                    }
+                }
+            }
+        }
+        if let s = s {
             let parts = s.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             if parts.count == 3 {
                 biasDeg = (parts[0], parts[1], parts[2])
@@ -568,6 +817,7 @@ final class GamepadGyroCalibrator: ObservableObject {
         sampleTimer?.invalidate()
         sampleTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
             guard let self = self, self.phase == .sampling else { return }
+            if !self.proBuffers.isEmpty { return } // Native Pro Controller HID is active; prevent sample collision
             if ProcessInfo.processInfo.systemUptime - self.lastSampleTime > 0.035 {
                 for c in GCController.controllers() {
                     if let name = c.vendorName, name.localizedCaseInsensitiveContains("Joy-Con") {
@@ -600,15 +850,19 @@ final class GamepadGyroCalibrator: ObservableObject {
         let zs = samples.map { $0.2 }.sorted()
         let medX = xs[n / 2], medY = ys[n / 2], medZ = zs[n / 2]
 
+        // Relaxed scatter tolerance: human motion is typically > 50-200 deg/s.
+        // Bluetooth packet timing jitter and resting sensor noise can scatter ~15-20 deg/s.
+        // 0.35 rad/s ≈ 20.0 deg/s deviation from median.
         var inliers: [(Double, Double, Double)] = []
         for s in samples {
             let dist = sqrt(pow(s.0 - medX, 2) + pow(s.1 - medY, 2) + pow(s.2 - medZ, 2))
-            if dist <= 0.1 {
+            if dist <= 0.35 {
                 inliers.append(s)
             }
         }
         let outliers = n - inliers.count
-        guard !inliers.isEmpty && outliers <= max(1, n / 10) else {
+        // Allow up to 35% outliers due to Bluetooth bursts/packet jitter, requiring at least 20 stable inliers.
+        guard inliers.count >= 20 && outliers <= max(5, n / 3) else {
             phase = .moved
             return
         }
@@ -616,6 +870,7 @@ final class GamepadGyroCalibrator: ObservableObject {
         let meanY = inliers.map { $0.1 }.reduce(0, +) / Double(inliers.count)
         let meanZ = inliers.map { $0.2 }.reduce(0, +) / Double(inliers.count)
         let normMean = sqrt(meanX * meanX + meanY * meanY + meanZ * meanZ)
+        // Max bias threshold: 1.05 rad/s ≈ 60.1 deg/s.
         guard normMean <= 1.05 else {
             phase = .noData
             return
@@ -627,8 +882,28 @@ final class GamepadGyroCalibrator: ObservableObject {
         UserDefaults.standard.set(val, forKey: "DmGyroBias")
         UserDefaults.standard.set(val, forKey: "launcher.DM_GYRO_BIAS")
         setenv("DM_GYRO_BIAS", val, 1)
+        saveEnvBias(val)
         phase = .done
         fputs("[gyro] calibrated: bias (\(val)) deg/s\n", stderr)
+    }
+
+    private func saveEnvBias(_ val: String?) {
+        guard let home = ProcessInfo.processInfo.environment["HOME"] else { return }
+        let titleId = (Bundle.main.object(forInfoDictionaryKey: "DMTitleID") as? String) ?? "0100000000010000"
+        let sup = "\(home)/Library/Application Support/nxnative/\(titleId)"
+        let envPath = "\(sup)/env.txt"
+        var lines: [String] = []
+        if let content = try? String(contentsOfFile: envPath, encoding: .utf8) {
+            lines = content.components(separatedBy: "\n").filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return !trimmed.hasPrefix("DM_GYRO_BIAS=") && !trimmed.hasPrefix("DM_GYRO_BIAS ")
+            }
+        }
+        if let val = val, !val.isEmpty {
+            lines.append("DM_GYRO_BIAS=\(val)")
+        }
+        let newContent = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.joined(separator: "\n") + "\n"
+        try? newContent.write(toFile: envPath, atomically: true, encoding: .utf8)
     }
 
     func clearCalibration() {
@@ -639,6 +914,7 @@ final class GamepadGyroCalibrator: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "DmGyroBias")
         UserDefaults.standard.removeObject(forKey: "launcher.DM_GYRO_BIAS")
         unsetenv("DM_GYRO_BIAS")
+        saveEnvBias(nil)
         phase = .idle
         fputs("[gyro] calibration cleared\n", stderr)
     }
