@@ -202,7 +202,13 @@ struct LauncherView: View {
             let rows = m.rows(in: section, basic: basic)
             if !rows.isEmpty {
                 Section(section) {
-                    ForEach(rows) { SettingRow(s: $0, m: m) }
+                    ForEach(rows) { s in
+                        if s.env == "DM_METAL_HUD" {
+                            PerformanceHudRow(s: s, m: m)
+                        } else {
+                            SettingRow(s: s, m: m)
+                        }
+                    }
                 }
             }
         }
@@ -347,6 +353,210 @@ struct GyroCalSection: View {
                     .foregroundColor(.secondary)
                     .font(.callout)
             }
+        }
+    }
+}
+
+struct PerformanceHudRow: View {
+    let s: Setting
+    @ObservedObject var m: LauncherModel
+
+    enum HudPreset: String, CaseIterable, Identifiable {
+        case off = "0"
+        case fpsOnly = "fps"
+        case fpsMemory = "fps_memory"
+        case full = "full"
+        case custom = "custom"
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .off: return "Off"
+            case .fpsOnly: return "FPS Only"
+            case .fpsMemory: return "FPS + Memory"
+            case .full: return "Full (Default)"
+            case .custom: return "Custom…"
+            }
+        }
+    }
+
+    @AppStorage("launcher.MTL_HUD_PRESET") private var presetRaw = "0"
+    @AppStorage("launcher.MTL_HUD_ELEMENTS") private var customElements = "fps"
+    @AppStorage("launcher.MTL_HUD_ALIGNMENT") private var alignment = "12"
+    @AppStorage("launcher.MTL_HUD_SCALE") private var scaleStr = "0.117461"
+
+    private var locked: Bool { m.fixed.contains(s.env) || m.fixed.contains("MTL_HUD_ELEMENTS") }
+
+    private var currentPreset: Binding<HudPreset> {
+        Binding(
+            get: {
+                if (m.values["DM_METAL_HUD"] ?? s.def) == "0" {
+                    return .off
+                }
+                return HudPreset(rawValue: presetRaw) ?? .fpsOnly
+            },
+            set: { next in
+                presetRaw = next.rawValue
+                switch next {
+                case .off:
+                    m.values["DM_METAL_HUD"] = "0"
+                case .fpsOnly:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "fps"
+                    scaleStr = "0.117461"
+                    alignment = "12"
+                case .fpsMemory:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "memory,fps"
+                    scaleStr = "0.147233"
+                    alignment = "12"
+                case .full:
+                    m.values["DM_METAL_HUD"] = "1"
+                    customElements = "default"
+                    scaleStr = "0.200000"
+                case .custom:
+                    m.values["DM_METAL_HUD"] = "1"
+                }
+                syncEnv()
+            }
+        )
+    }
+
+    private var scaleBinding: Binding<Double> {
+        Binding(
+            get: { Double(scaleStr) ?? 0.12 },
+            set: {
+                scaleStr = String(format: "%.6f", $0)
+                syncEnv()
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker(selection: currentPreset) {
+                ForEach(HudPreset.allCases) { p in
+                    Text(p.title).tag(p)
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Performance HUD")
+                    if locked {
+                        Text(m.fromLaunch.contains(s.env) || m.fromLaunch.contains("MTL_HUD_ELEMENTS") ? "Set at launch" : "Set by an env file")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } else if currentPreset.wrappedValue == .off {
+                        Text("Shows Apple Metal HUD metrics during gameplay.").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(locked)
+
+            if !locked && currentPreset.wrappedValue != .off {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Position").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $alignment) {
+                            Text("Top Right").tag("12")
+                            Text("Top Left").tag("9")
+                            Text("Bottom Right").tag("6")
+                            Text("Bottom Left").tag("3")
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 150)
+                        .onChange(of: alignment) { _, _ in syncEnv() }
+                    }
+
+                    HStack {
+                        Text("Scale").font(.subheadline)
+                        Spacer()
+                        Slider(value: scaleBinding, in: 0.08...0.30, step: 0.01)
+                            .frame(width: 140)
+                        Text(String(format: "%.2f", scaleBinding.wrappedValue))
+                            .font(.caption.monospacedDigit())
+                            .frame(width: 36, alignment: .trailing)
+                    }
+
+                    if currentPreset.wrappedValue == .custom {
+                        HStack {
+                            Text("Elements").font(.subheadline)
+                            Spacer()
+                            TextField("e.g. fps, memory,fps", text: $customElements)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 180)
+                                .onChange(of: customElements) { _, _ in syncEnv() }
+                        }
+                    }
+                }
+                .padding(.leading, 8)
+                .padding(.vertical, 4)
+            }
+        }
+        .onAppear {
+            loadInitialState()
+        }
+        .onChange(of: m.values["DM_METAL_HUD"]) { _, val in
+            if (val ?? s.def) == "0" && presetRaw != "0" {
+                presetRaw = "0"
+                syncEnv()
+            }
+        }
+    }
+
+    private func loadInitialState() {
+        guard !locked else { return }
+        let env = ProcessInfo.processInfo.environment
+        if let elem = env["MTL_HUD_ELEMENTS"], !elem.isEmpty {
+            customElements = elem
+            if elem == "fps" { presetRaw = "fps" }
+            else if elem == "memory,fps" || elem == "fps,memory" { presetRaw = "fps_memory" }
+            else { presetRaw = "custom" }
+        }
+        if let align = env["MTL_HUD_ALIGNMENT"], !align.isEmpty {
+            alignment = align
+        }
+        if let sc = env["MTL_HUD_SCALE"], !sc.isEmpty {
+            scaleStr = sc
+        }
+        if (m.values["DM_METAL_HUD"] ?? s.def) == "1" && presetRaw == "0" {
+            presetRaw = "fps"
+        }
+        syncEnv()
+    }
+
+    private func syncEnv() {
+        guard !locked else { return }
+        let preset = currentPreset.wrappedValue
+        if preset == .off {
+            m.values["DM_METAL_HUD"] = "0"
+            setenv("DM_METAL_HUD", "0", 1)
+            setenv("MTL_HUD_ENABLED", "0", 1)
+            unsetenv("MTL_HUD_ELEMENTS")
+            unsetenv("MTL_HUD_ALIGNMENT")
+            unsetenv("MTL_HUD_SCALE")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ELEMENTS")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ALIGNMENT")
+            UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_SCALE")
+        } else {
+            m.values["DM_METAL_HUD"] = "1"
+            setenv("DM_METAL_HUD", "1", 1)
+            setenv("MTL_HUD_ENABLED", "1", 1)
+
+            let elem = (preset == .full) ? "" : customElements
+            if elem.isEmpty || elem == "default" {
+                unsetenv("MTL_HUD_ELEMENTS")
+                UserDefaults.standard.removeObject(forKey: "launcher.MTL_HUD_ELEMENTS")
+            } else {
+                setenv("MTL_HUD_ELEMENTS", elem, 1)
+                UserDefaults.standard.set(elem, forKey: "launcher.MTL_HUD_ELEMENTS")
+            }
+
+            setenv("MTL_HUD_ALIGNMENT", alignment, 1)
+            UserDefaults.standard.set(alignment, forKey: "launcher.MTL_HUD_ALIGNMENT")
+
+            setenv("MTL_HUD_SCALE", scaleStr, 1)
+            UserDefaults.standard.set(scaleStr, forKey: "launcher.MTL_HUD_SCALE")
         }
     }
 }
