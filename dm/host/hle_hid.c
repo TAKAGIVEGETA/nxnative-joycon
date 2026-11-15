@@ -809,6 +809,7 @@ static live_motion g_joy_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 .
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
 static pthread_once_t g_motion_once = PTHREAD_ONCE_INIT;
 static motion_map g_motion_map; static float g_motion_gain = 0.5f; static int g_motion_off, g_motion_log, g_phone_mode;
+static float g_gyro_bias[3]; static int g_gyro_bias_set;
 static void motion_env(void) {
     const char *e = getenv("DM_MOTION"); g_motion_off = e && !atoi(e);
     if (!motion_map_parse(&g_motion_map, getenv("DM_MOTION_AXES"))) LOG("[hid] DM_MOTION_AXES='%s' is not like \"x,-z,y\": using x,y,z", getenv("DM_MOTION_AXES"));
@@ -816,6 +817,17 @@ static void motion_env(void) {
     if ((e = getenv("DM_MOTION_GAIN"))) g_motion_gain = (float)atof(e);
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
+    const char *gb = getenv("DM_GYRO_BIAS");
+    if (gb && strcmp(gb, "0")) {
+        double d[3]; int used = 0;
+        if (sscanf(gb, " %lf , %lf , %lf %n", &d[0], &d[1], &d[2], &used) == 3 && used > 0) {
+            g_gyro_bias[0] = (float)(d[0] * M_PI / 180.0);
+            g_gyro_bias[1] = (float)(d[1] * M_PI / 180.0);
+            g_gyro_bias[2] = (float)(d[2] * M_PI / 180.0);
+            g_gyro_bias_set = 1;
+            LOG("[hid] controller gyro bias applied: (%+.4f %+.4f %+.4f) deg/s (DM_GYRO_BIAS)", d[0], d[1], d[2]);
+        }
+    }
 }
 static void motion_set_to(live_motion *m, int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns);
 static void motion_set(int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
@@ -854,6 +866,11 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
     else if (t - m->last_ns > MOTION_REST_GAP_NS) motion_rest_break(&m->rest);   // a gap: the rest window starts again
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
+    float gb_rot[3] = {rot[0], rot[1], rot[2]};
+    if (g_gyro_bias_set && (m == &g_motion[p] || m == &g_hid_motion[p])) {
+        gb_rot[0] -= g_gyro_bias[0]; gb_rot[1] -= g_gyro_bias[1]; gb_rot[2] -= g_gyro_bias[2];
+        rot = gb_rot;
+    }
     // GameController reports the gyro with its rest offset (a DualSense: 0.34, 0.20, -0.66 deg/s): the host learns it while the controller rests and takes it off (motion_rest),
     // as the Joy-Con 2 front end does for its own (s2_rest); the HID and phone sources come corrected
     float rc[3]; if (!source) { motion_rest_update(&m->rest, acc, rot, (double)t / 1e9); motion_rest_apply(&m->rest, rot, (double)t / 1e9, rc); rot = rc; }
