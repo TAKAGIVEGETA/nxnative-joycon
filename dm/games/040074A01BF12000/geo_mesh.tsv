@@ -1,7 +1,15 @@
 # kind: evidence  vertex key <TAB> geometry key: lean passthrough geometry pairs that get a mesh library (dm/gfx/tools/dmsh_mesh.py) although no prewarm recording has reached them yet;
-# the pairs a recording met are pso_manifest.tsv's G rows (the first level's f9c807930abd1234). Both are other SilverStarMaterial vertex variants with the first level's kernel,
-# from the host's "geometry compute path" line in PR #2641's sessions (M5 Pro): b64d15d642f9d2d6 drew every compute-path geometry draw of a 2026-11-09 session (50,000-225,000
-# per log window); d03b61c4697e4605 (var14) is the 3D map's terrain, up to 665,000 draws per 300-frame window panning the map of Sublayer 900 (2026-11-14). A recording that
-# reaches them (with no library, the host writes their G rows) replaces these rows
+# the pairs a recording met are pso_manifest.tsv's G rows (the first level's f9c807930abd1234). All are SilverStarMaterial vertex variants with the first level's kernel (BNSH@0x548d000),
+# from the host's "geometry compute path" line in PR #2641's sessions (M5 Pro) and later Sublayer 800 gameplay: b64d15d642f9d2d6 drew every compute-path geometry draw of a 2026-11-09 session
+# (50,000-225,000 per log window); d03b61c4697e4605 (var14) is the 3D map's terrain, up to 665,000 draws per 300-frame window panning the map of Sublayer 900 (2026-11-14); a351a4a1090ca16b
+# (var10) and 48f3ff4283ad511c (var24) drew up to 396,000 and 601,000 draws per 300-frame window in Sublayer 800. A recording that reaches them replaces these rows
+a351a4a1090ca16b	5d537f7630ec3671
 b64d15d642f9d2d6	5d537f7630ec3671
 d03b61c4697e4605	5d537f7630ec3671
+b84459700ab292a9	5d537f7630ec3671
+a20eafbe62163516	5d537f7630ec3671
+48f3ff4283ad511c	5d537f7630ec3671
+2550852980a24249	5d537f7630ec3671
+a504d5de36060114	5d537f7630ec3671
+3b3ff7469bac9d14	5d537f7630ec3671
+
