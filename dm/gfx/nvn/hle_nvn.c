@@ -778,7 +778,8 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
-    pthread_mutex_lock(&g_sub_mu); mtl_prog_forget((const prog_t *)p); mtl_prog_release((prog_t *)p); pthread_mutex_unlock(&g_sub_mu);
+    pthread_mutex_lock(&g_sub_mu); mtl_prog_forget((const prog_t *)p); pthread_mutex_unlock(&g_sub_mu);
+    mtl_prog_release((prog_t *)p);
     ((prog_t *)p)->magic = 0;
 }
 // A program's per-stage keys, one record per SetShaders, found by prog_t.serial (bit i of ok = stage i computed). A game may copy an NVNprogram after SetShaders and draw with
@@ -842,7 +843,7 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
-    pthread_mutex_lock(&g_sub_mu); mtl_prog_release(o); pthread_mutex_unlock(&g_sub_mu);
+    mtl_prog_release(o);
     o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     // The keys are computed here (see prog_key in nvn_obj.h): the control section is only guaranteed valid during this call; the code area lives in a memory pool and stays valid while the program is in use
     static int dump = -1; if (dump < 0) dump = getenv("DM_NVN_SHDUMP") != NULL;

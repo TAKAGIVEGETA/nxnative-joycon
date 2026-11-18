@@ -96,7 +96,7 @@ enum {
     RO_NOTE,   // a[0] an _Atomic uint64_t, a[1] a value: the encode thread has made every call before this one (rec_note_wait)
 };
 typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj slots hold retained objects (0 for nil), released once the call is made
-enum { REC_BLK = 256 };
+enum { REC_BLK = 1024 };
 typedef struct rec_blk { struct rec_blk *next; int n; rec_t r[REC_BLK]; } rec_blk;
 
 // On by default on iOS: Breath of the Wild on an iPhone 17 Pro Max (handheld, the Great Plateau) took about 8 ms of submit thread per frame without it and 3.3–4.5 ms with it
@@ -117,8 +117,8 @@ static pthread_cond_t g_rb_work = PTHREAD_COND_INITIALIZER, g_rb_idle = PTHREAD_
 static rec_blk *g_rb_cur, *g_rb_head, *g_rb_tail, *g_rb_free;   // the submit thread's open block; blocks waiting for the encode thread; empty blocks
 static int g_rb_busy, g_rb_started, g_rb_sleeping;              // the encode thread is working through a block; the thread exists; it waits for work
 
-static inline uint64_t rec_obj(id o) { return o ? (uint64_t)(uintptr_t)CFBridgingRetain(o) : 0; }
-static inline id rec_id(uint64_t v) { return (__bridge id)(void *)(uintptr_t)v; }
+static inline uint64_t rec_obj(__unsafe_unretained id o) { return o ? (uint64_t)(uintptr_t)CFBridgingRetain(o) : 0; }
+#define rec_id(v) ((__bridge id)(void *)(uintptr_t)(v))
 static inline uint64_t rec_f(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static inline float rec_fv(uint64_t v) { uint32_t u = (uint32_t)v; float f; memcpy(&f, &u, 4); return f; }
 
@@ -214,7 +214,7 @@ static void rx_commit(int cur, DmCommitFB *own, uint64_t ubc) {
 }
 static void rx_flush(void) { if (g_rx_npend) rx_commit(0, nil, 0); }   // the held command buffers go to the queue now
 static void rec_exec(const rec_t *r) {
-    const uint64_t *a = r->a; id e = g_rx_enc;
+    const uint64_t *a = r->a; __unsafe_unretained id e = g_rx_enc;
     int after = g_rx_after; if (r->op != RO_SIGNAL && r->op != RO_NOTE) g_rx_after = 0;
     switch (r->op) {
     case RO_CB_NEW: g_rx_cb = [g_dev newCommandBuffer]; break;
@@ -222,7 +222,7 @@ static void rec_exec(const rec_t *r) {
     case RO_CB_END: cb_end(g_rx_cb, nil); break;   // names the residency sets (nvn_mtl.m res_name)
     case RO_CB_BLOCK: ((void (^)(id<MTL4CommandBuffer>))rec_id(a[0]))(g_rx_cb); break;
     case RO_COMMIT: {   // a main command buffer (ended): a[0] its feedback, a[2] its uniform shadows, a[5] the submission ends with it
-        DmCommitFB *fb = rec_id(a[0]);
+        __unsafe_unretained DmCommitFB *fb = rec_id(a[0]);
         if (a[5] && fb && g_rx_npend < RX_PEND_MAX && rx_busy() && !atomic_load(&g_rx_drain) && rx_merge_on()) {   // held: the GPU has work
             g_rx_held_cb[g_rx_npend] = g_rx_cb; g_rx_fb[g_rx_npend] = fb; g_rx_stamp[g_rx_npend] = -1; g_rx_stamp_heap[g_rx_npend] = nil; g_rx_npend++; if (a[2] > g_rx_ubc) g_rx_ubc = a[2];
             g_rx_cb = nil; g_rx_after = 1; g_rx_want_stamp = 1; atomic_store(&g_rx_held, 1);
@@ -231,7 +231,7 @@ static void rec_exec(const rec_t *r) {
         break; }
     case RO_COMMIT_REAL: {   // an upload batch, a snapshot copy: a whole command buffer, after everything recorded before it
         rx_flush();
-        id<MTL4CommandBuffer> buffers[] = {rec_id(a[1])}; MTL4CommitOptions *o = rec_id(a[0]);
+        __unsafe_unretained id<MTL4CommandBuffer> buffers[] = {rec_id(a[1])}; __unsafe_unretained MTL4CommitOptions *o = rec_id(a[0]);
         pthread_mutex_lock(&g_res_commit_mu);   // apart from the residency set's commit, as the present snapshot's queue commit (nvn_mtl.m res_commit)
         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
         rx_mark(); pthread_mutex_unlock(&g_res_commit_mu);

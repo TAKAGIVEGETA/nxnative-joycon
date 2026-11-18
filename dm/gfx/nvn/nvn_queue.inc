@@ -11,7 +11,7 @@ typedef struct nq_signal { volatile uint32_t *event; unsigned mode; uint32_t val
 typedef struct nq_node {
     struct nq_node *next;
     uint8_t *bytes; size_t length, capacity;
-    unsigned kind, mode, closed, waiting; volatile uint32_t *event; uint32_t value;
+    unsigned kind, mode, closed, waiting, has_dispatch; volatile uint32_t *event; uint32_t value;
     uint64_t wait_fence, event_predecessor, wait_since; unsigned wait_kind, wait_said; const sync_t *sync_source; nq_receipt *receipt;
     nq_signal *signals; unsigned signal_count;   // NQ_COMMANDS: every event signal it records, in order (nq_event_issued at its commit)
     tex_t texture; double period; int crop[4];
@@ -134,7 +134,7 @@ static void *nq_worker(void *unused) {
             for(q=nq_queues;q;q=q->next) {
                 j=q->first; if(!j) continue; n=j->first;
                 if(!n) { nq_publish(j->receipt,q->physical); q->first=j->next; if(!q->first) q->last=NULL; nq_put(j->receipt);
-                    pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); nq_job_free(j); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); goto scan_again; }
+                    pthread_mutex_unlock(&nq_mu); void *pool=objc_autoreleasePoolPush(); nq_job_free(j); objc_autoreleasePoolPop(pool); pthread_mutex_lock(&nq_mu); goto scan_again; }
                 if(n->kind==NQ_EVENT && n->event) {
                     uint64_t predecessor=nq_event_pending(n->event);
                     if(!n->waiting) n->event_predecessor=predecessor;
@@ -187,7 +187,7 @@ static void *nq_worker(void *unused) {
                 uint64_t handle=(uintptr_t)n->bytes;
                 nvn_cap_submit(1,&handle);
                 mtl_sub_begin(); mtl_sub_ready(j->submitted>q->wait_passed?j->submitted:q->wait_passed); nvn_ft_poll();
-                mtl_exec_rest(NULL,0); mtl_exec(n->bytes); fence=mtl_sub_commit();
+                mtl_exec_rest(NULL,0); mtl_exec_has_dispatch((int)n->has_dispatch); mtl_exec(n->bytes); fence=mtl_sub_commit();
             } else {
                 nvn_cap_present(&n->texture,n->crop);
                 present=mtl_present(&n->texture,n->period,n->crop,&copy); mtl_tex_unpin(n->texture.serial);
@@ -234,6 +234,7 @@ static void nq_record_one(nq_job *j,const uint8_t *p,op_hdr h) {
         else { memcpy(&n->sync_source,a,8); if(h.op==OP_FENCE_SYNC) n->receipt=nq_new(); }
     } else {
         nq_node *n=j->last; if(!n || n->kind!=NQ_COMMANDS || n->closed) n=nq_append(j,NQ_COMMANDS);
+        if(h.op==OP_DISPATCH) n->has_dispatch=1;
         size_t offset=n->length; nq_bytes(n,p,h.size); if(!n->bytes) die("queue commands: a record of %u bytes",h.size);
         if(h.op==OP_AS_BUILD) {
             if(h.size<8+sizeof(p_as_build))die("invalid acceleration-structure command size");
@@ -265,13 +266,20 @@ static void nq_flatten(nq_job *j,const uint8_t *list) {
     }
 }
 static void nq_enqueue(nq_queue *q,nq_job *j) { if(q->last) q->last->next=j; else q->first=j; q->last=j; nq_put(q->tail); q->tail=j->receipt; q->tail->refs++; pthread_cond_broadcast(&nq_cv); }
+static pthread_mutex_t g_flat_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_prepare_done;
 void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
     j->objects.klen=16; j->frame=dm_nvn_frame_count(); j->submitted=guest_ns();
-    // No scheduler lock while copying descriptors or resolving shader libraries.
-    dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
+    // Run one-time prepare under g_sub_mu so concurrent submits contend on g_sub_mu until prepare completes, then flatten under g_flat_mu without waiting on nq_worker's replay.
+    if(!atomic_load_explicit(&g_prepare_done,memory_order_acquire)) {
+        dm_host_mutex_lock(&g_sub_mu); void *pp=objc_autoreleasePoolPush();
+        if(!atomic_load_explicit(&g_prepare_done,memory_order_relaxed)) { dm_host_work++; mtl_prepare(); dm_host_work--; atomic_store_explicit(&g_prepare_done,1,memory_order_release); }
+        objc_autoreleasePoolPop(pp); pthread_mutex_unlock(&g_sub_mu);
+    }
+    dm_host_mutex_lock(&g_flat_mu); void *pool=objc_autoreleasePoolPush(); nq_cost cost=nq_cost_begin();
     for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i]); nq_end(j);
-    nq_cost_end(cost); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+    nq_cost_end(cost); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_flat_mu);
     int waits=0; for(nq_node *node=j->first;node;node=node->next) waits|=node->kind==NQ_EVENT || node->kind==NQ_SYNC;
     nvn_cap_queue(q->serial,waits);
     pthread_mutex_lock(&nq_mu);

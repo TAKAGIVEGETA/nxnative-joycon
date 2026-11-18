@@ -557,21 +557,35 @@ own_dead_stats own_alias_dead_locked(uint32_t now, uint32_t idle, own_use_fn use
 
 // A submitted descriptor and a queue binding hold the compiled program by its immutable initialization serial. Retaining it must not mint serial aliases:
 // alias churn invalidates texture tables and changes composite-program keys
+// Program pins: retained while any queued submission still holds a program descriptor copy. Under g_pmu (leaf lock: serial_del runs after unlocking g_pmu so lock order with g_smu never inverts)
 typedef struct { unsigned refs, retired; } prog_pin;
-static nvn_hmap g_prog_pins = {.klen = 8};   // protected by the submission lock
+static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_hmap g_prog_pins = {.klen = 8};
 void mtl_prog_release(prog_t *p) {
-    if (!p->serial) return;
-    prog_pin *pin = nvn_hm_get(&g_prog_pins, &p->serial);
-    if (pin) pin->retired = 1; else serial_del(p->serial);
+    uint64_t ser = p->serial;
+    if (!ser) return;
+    uint64_t del = 0;
+    pthread_mutex_lock(&g_pmu);
+    prog_pin *pin = nvn_hm_get(&g_prog_pins, &ser);
+    if (pin) pin->retired = 1; else del = ser;
+    pthread_mutex_unlock(&g_pmu);
+    if (del) serial_del(del);
 }
 void mtl_prog_unpin(prog_t *p) {
-    prog_pin *pin = nvn_hm_get(&g_prog_pins, &p->serial);
-    if (pin && !--pin->refs) { nvn_hm_del(&g_prog_pins, &p->serial); if (pin->retired) serial_del(p->serial); free(pin); }
+    uint64_t ser = p->serial, del = 0;
+    if (!ser) return;
+    pthread_mutex_lock(&g_pmu);
+    prog_pin *pin = nvn_hm_get(&g_prog_pins, &ser);
+    if (pin && !--pin->refs) { nvn_hm_del(&g_prog_pins, &ser); if (pin->retired) del = ser; free(pin); }
+    pthread_mutex_unlock(&g_pmu);
+    if (del) serial_del(del);
 }
 void own_prog_pin(uint64_t serial) {
+    pthread_mutex_lock(&g_pmu);
     prog_pin *pin = nvn_hm_get(&g_prog_pins, &serial);
     if (!pin) { pin = calloc(1, sizeof *pin); if (!pin) ODIE("program retention allocation failed"); nvn_hm_put(&g_prog_pins, &serial, pin); }
     pin->refs++;
+    pthread_mutex_unlock(&g_pmu);
 }
 
 own_alias_unheld own_alias_unheld_locked(void) {
