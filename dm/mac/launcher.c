@@ -197,6 +197,21 @@ static void metal_hud_choice(void) {
     }
 }
 
+static void map_fps_choice(void) {
+    if (getenv("DM_MAP_FPS_MODE")) return;
+    CFStringRef domain = CFBundleGetIdentifier(CFBundleGetMainBundle());
+    if (!domain) return;
+    CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("launcher.DM_MAP_FPS_MODE"), domain);
+    if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+        char val[16];
+        if (CFStringGetCString(v, val, sizeof val, kCFStringEncodingUTF8) && (val[0] == '1' || val[0] == '2') && !val[1]) {
+            setenv("DM_MAP_FPS_MODE", val, 0);
+            fprintf(stderr, "launcher: env DM_MAP_FPS_MODE=%s (saved choice)\n", val);
+        }
+    }
+    if (v) CFRelease(v);
+}
+
 // Cloud saves: the folder chosen in the settings window (Launcher.swift CloudSavesSection, cloudSaves.folder in the app's preferences) becomes DM_SAVE_SYNC
 // (dm/host/save_sync.h), with or without the window; a DM_SAVE_SYNC the launch environment or an env file set wins. A front end may write the key too (docs/frontends.md, The cloud saves folder)
 static void cloud_saves_folder(void) {
@@ -271,6 +286,7 @@ int main(int argc, char **argv) {
     cloud_saves_folder();
     gyro_bias_choice();
     metal_hud_choice();
+    map_fps_choice();
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_TEMP", temp, 0);
     snprintf(p, sizeof p, "%s/Library/Application Support/nxnative/system", home); setenv("DM_SYSTEM_DIR", p, 0);   // the player's own console files, for every game
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);

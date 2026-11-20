@@ -5614,6 +5614,28 @@ enum { ED_SREF = 1, ED_VP = 2, ED_SC = 4, ED_CULL = 8, ED_WIND = 16, ED_FILL = 3
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
 static uint64_t g_stat_args_enc, g_stat_args_reuse, g_stat_args_patch;   // Argument buffer: new-encode / reuse / patched (only CBUF slots written again) counts
+static uint8_t g_map_mask_frame; static int g_map_miss; static _Atomic int g_map_active;
+int mtl_map_fps_mode(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_MAP_FPS_MODE");
+        v = e ? atoi(e) : 0;
+        if (v < 0 || v > 2) v = 0;
+        if (v) MLOG("DM_MAP_FPS_MODE=%d: 3D overview map %s", v, v == 2 ? "lock 30 fps + 2x MetalFX (Stage A: 30 fps lock)" : "lock 30 fps");
+    }
+    return v;
+}
+int mtl_map_active(void) { return atomic_load_explicit(&g_map_active, memory_order_relaxed); }
+static void map_present_note(void) {
+    uint8_t seen = g_map_mask_frame; g_map_mask_frame = 0;
+    int was = atomic_load_explicit(&g_map_active, memory_order_relaxed), now = was;
+    if (seen == 3) { g_map_miss = 0; now = 1; }
+    else if (was && ++g_map_miss >= 2) { now = 0; }
+    if (now != was) {
+        atomic_store_explicit(&g_map_active, now, memory_order_relaxed);
+        if (mtl_map_fps_mode() > 0) MLOG("3D overview map %s (frame %llu)", now ? "opened: locking frame rate to 30 fps" : "closed: restoring normal frame rate", (unsigned long long)atomic_load(&g_cur_frame));
+    }
+}
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
@@ -6691,7 +6713,7 @@ static void shmap_read(void) {
     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
     id<MTLFunction> pfn, wlfn; int pfn_state, has_pull;   // wlfn: the wide-line entry of the pulling library (<ventry>_wl, dmsh_pull.py; nvn_wline.inc), nil when it has none
     id<MTLLibrary> alib; id<MTLFunction> afn[2]; int afn_state, has_alpha, has_bz;   // has_bz: its entry points read the blend weight word (bz_bind)
-    id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the side library <key>_bx for logic operations, lfn: fn's entry point (a shader without the typed-output one, which holds its own) specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names its entry points, dmsh_logic.py)   // afn: the alpha test entry points of fn and fn_d in the side library <key>_bx (alib), (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names them, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
+    id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; uint8_t map_marker; } @end   // llib: the side library <key>_bx for logic operations, lfn: fn's entry point (a shader without the typed-output one, which holds its own) specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names its entry points, dmsh_logic.py)   // afn: the alpha test entry points of fn and fn_d in the side library <key>_bx (alib), (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names them, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
 - (void)dealloc { free(rf.c1); free(geo_slot); }
 @end
@@ -7145,6 +7167,10 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     for (NSString *f in [ext componentsSeparatedByString:@" "]) { int r = 0, n = 0;
         if (sscanf(f.UTF8String, "%d:%d", &r, &n) == 2 && r >= 0 && r < 16 && n > 0) o->cb_ext[r] = (uint32_t)n;
         else if (sscanf(f.UTF8String, "s%d", &r) == 1 && r >= 0 && r < 32) o->sb_ro |= 1u << r; }
+    if (stage == 1) {
+        if (!strncmp(o->key, "e34f981821a2de5c", 16)) o->map_marker = 1;       // MapMaskCtrl::drawMapMask
+        else if (!strncmp(o->key, "41340d8af19a82e4", 16)) o->map_marker = 2;  // MapMaskCtrl::drawCompose
+    }
     shader_opt_init(o);
     return o;
 }
@@ -16509,6 +16535,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         }
     }
     g_kd_force = 0;
+    if (__builtin_expect(pr->sh[1] && pr->sh[1]->map_marker, 0)) g_map_mask_frame |= pr->sh[1]->map_marker;
     udc_note_draw(pr, raster_mask);
     swrite_note(pr); order_note(pr);
     if (g_fsp_pass) { fsp_encode(en, mp, dw, di); if (g_fsm_na) fsm_run((id<MTL4RenderCommandEncoder>)en); rp_end(); return; }
@@ -19631,7 +19658,7 @@ void mtl_link_pause(int on);
 // (hle_nvn.c nvnWindowAcquireTexture -> mtl_present_wait). Without clearing, the game cannot advance a single tick during those 2.5 seconds of waiting for the save, and the save is not written (the same pattern three times in player logs: 3 frames queued, 0 submits)
 void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if (on) present_drop_for_suspend(); }
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val, uint64_t *copy);
-uint64_t mtl_present(const tex_t *t, double period, const int crop[4], uint64_t *copy) { return present_enqueue(t, period, crop, 0, copy); }
+uint64_t mtl_present(const tex_t *t, double period, const int crop[4], uint64_t *copy) { map_present_note(); return present_enqueue(t, period, crop, 0, copy); }
 void *mtl_device(void) { mtl_init(); return (__bridge void *)g_dev; }
 // GL and Vulkan also accept a device without Metal 4. The classic fallback drops presents.
 void *mtl_device_classic(void) {

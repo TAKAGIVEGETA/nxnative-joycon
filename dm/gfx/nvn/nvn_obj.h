@@ -324,6 +324,8 @@ void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes);   // Cum
 uint64_t mtl_udc_saved_bytes(void);                                      // Write-back bytes actually saved by DM_NVN_UNWRITTEN_DC
 int mtl_has_window(void);
 int mtl_fps_target(void);                                   // target frame rate 30 / 60 / 120 (power-saving mode, DM_FPS, the game itself asking for 30, the 120 fps setting)
+int mtl_map_fps_mode(void);                                 // DM_MAP_FPS_MODE: 0 default, 1 lock 3D overview map to 30 fps, 2 lock 30 fps + 2x MetalFX (Stage A: locks 30 fps)
+int mtl_map_active(void);                                   // 1 while the 3D overview map (MapMaskCtrl) is rendering
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // vsyncs = the game's present interval

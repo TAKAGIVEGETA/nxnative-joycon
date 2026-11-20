@@ -113,6 +113,57 @@ static void dynamic_resolution_tick(void) {
     }
 }
 
+// Donkey Kong Bananza v458752 (e25c90c1c136638885659fd55bf8a03b):
+// Drive the game's native frame-rate controller (main+0x204a18) instead of overriding present_itv behind its back, so that locking the 3D overview map to 30 fps
+// updates BOTH the simulation rate (main+0x204c60 -> 30 fps / full-speed 1/30 s step) AND nvnWindowSetPresentInterval (main+0x204c00 -> interval 2).
+// Pointer chain verified from main+0x5bdfec / 0x5bf140 / 0x5bfb00:
+//   [main + 0x2455ca0] (GOT) -> System::sInstance -> [sys + 0x0] (sead::GameFrameworkOunce*) -> [gf + 0x218] (controller)
+// Controller layout (main+0x204a18): +0x00 min_interval (1/2), +0x04 max_interval (3), +0x0c up_frames, +0x40 cur_interval, +0x44 target_down, +0x48 late_cnt, +0x4c recovery_cnt, +0x50 cur_fps.
+__attribute__((weak)) int mtl_map_fps_mode(void) { return 0; }
+__attribute__((weak)) int mtl_map_active(void) { return 0; }
+static const struct { const char *build; uint32_t sys_got, ctrl_off; } k_bananza_map_fps[] = {
+    { "e25c90c1c136638885659fd55bf8a03b", 0x2455ca0, 0x218 },
+};
+static void bananza_map_fps_tick(void) {
+    static int state = -1, row, nlog;
+    static uint8_t *mbase;
+    if (state < 0) {
+        state = 0;
+        if (mtl_map_fps_mode() <= 0) return;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+            for (int k = 0; k < (int)(sizeof k_bananza_map_fps / sizeof *k_bananza_map_fps); k++)
+                if (!strcmp(g_mod[i].build_id, k_bananza_map_fps[k].build)) { mbase = g_mod[i].base; row = k; state = 1; break; }
+        if (!state) return;
+    }
+    if (!state) return;
+    uint64_t got = 0, sys = 0, gf = 0, ctrl = 0;
+    if (!rd((uint64_t)(uintptr_t)(mbase + k_bananza_map_fps[row].sys_got), &got, sizeof got) || !got) return;
+    if (!rd(got, &sys, sizeof sys) || !sys) return;
+    if (!rd(sys, &gf, sizeof gf) || !gf) return;
+    if (!rd(gf + k_bananza_map_fps[row].ctrl_off, &ctrl, sizeof ctrl) || !ctrl) return;
+    uint32_t cfg[4] = {0}, st[5] = {0};
+    if (!rd(ctrl, cfg, sizeof cfg) || !rd(ctrl + 0x40, st, sizeof st)) return;
+    if ((cfg[0] != 1 && cfg[0] != 2) || cfg[1] < 2 || cfg[1] > 4 || st[0] < 1 || st[0] > 3 || st[4] < 15 || st[4] > 120) return;
+    uint32_t want_min = mtl_map_active() ? 2u : 1u;
+    if (cfg[0] != want_min) {
+        uint32_t *pmin = (uint32_t *)(uintptr_t)ctrl;
+        dm_guest_write_prepare(pmin, 4);
+        __atomic_store_n(pmin, want_min, __ATOMIC_RELAXED);
+        if (want_min == 2u && st[0] < 2u) {
+            uint32_t *plate = (uint32_t *)(uintptr_t)(ctrl + 0x48);
+            dm_guest_write_prepare(plate, 4);
+            __atomic_store_n(plate, cfg[3], __ATOMIC_RELAXED);   // satisfy late-frame count immediately
+        } else if (want_min == 1u && st[0] == 2u) {
+            uint32_t *pdown = (uint32_t *)(uintptr_t)(ctrl + 0x44);
+            uint32_t *prec = (uint32_t *)(uintptr_t)(ctrl + 0x4c);
+            dm_guest_write_prepare(pdown, 12);
+            __atomic_store_n(pdown, 1u, __ATOMIC_RELAXED);
+            __atomic_store_n(prec, 0u, __ATOMIC_RELAXED);        // step back to 60 fps on next tick
+        }
+        if (nlog++ < 32) LOG("main: Bananza frame-rate controller min_interval %u → %u (cur_itv=%u, cur_fps=%u)", cfg[0], want_min, st[0], st[4]);
+    }
+}
+
 // Frostbite's simulation rate, found by name (no fixed addresses, so it holds across a game's updates). Frostbite reflects its settings classes: a class record (its name, then at
 // +0x40 its field list) and per field a record of 0x20 bytes (name, hash, offset at +0x10, type). SimulationTimeSettings' ForceSimRate (int32) and MaxSimFps (float) cap the
 // simulation's ticks a second: 30 in EA SPORTS FC 27, whose frames then cannot go faster than 30 whatever paces them. A static constructor registers the class: it stores the record's
@@ -259,6 +310,7 @@ int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return nrow ||
 int nvn_fps_high_now(void);   // hle_nvn.c
 void dm_fps_lock_tick(void) {
     dynamic_resolution_tick();   // separate from the FPS cap
+    bananza_map_fps_tick();      // 3D overview map native 30/60 controller switch (DM_MAP_FPS_MODE)
     static int state = -2, nlog[MAX_LOCKS], target, high; static const char *src;
     if (state == -1) return;
     if (state == -2) {
