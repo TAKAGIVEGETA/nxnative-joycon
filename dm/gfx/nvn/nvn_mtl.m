@@ -5619,9 +5619,8 @@ int mtl_map_fps_mode(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_MAP_FPS_MODE");
-        v = e ? atoi(e) : 0;
-        if (v < 0 || v > 2) v = 0;
-        if (v) MLOG("DM_MAP_FPS_MODE=%d: 3D overview map %s", v, v == 2 ? "lock 30 fps + 2x MetalFX (Stage A: 30 fps lock)" : "lock 30 fps");
+        v = e && atoi(e) == 1 ? 1 : 0;
+        if (v) MLOG("DM_MAP_FPS_MODE=1: 3D overview map lock 30 fps");
     }
     return v;
 }

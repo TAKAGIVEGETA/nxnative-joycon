@@ -219,7 +219,7 @@ struct LauncherView: View {
 }
 
 /// 3D Overview Map frame rate policy for Donkey Kong Bananza (DM_MAP_FPS_MODE):
-/// 0 = Default, 1 = Lock 30 FPS, 2 = 30 -> 60 FPS (2x MetalFX, Stage A currently locks 30 FPS).
+/// 0 = Default, 1 = Lock 30 FPS.
 struct MapFrameRateSection: View {
     @ObservedObject var m: LauncherModel
     @AppStorage("launcher.DM_MAP_FPS_MODE") private var modeRaw = "0"
@@ -230,8 +230,6 @@ struct MapFrameRateSection: View {
         switch modeRaw {
         case "1":
             return "Locks the 3D overview map to 30 FPS while keeping normal gameplay at 60 FPS."
-        case "2":
-            return "Locks the 3D overview map to 30 FPS and enables 2x MetalFX frame interpolation (Stage A preview: currently locks 30 FPS only)."
         default:
             return "Uses the game's default frame pacing in the 3D overview map."
         }
@@ -241,7 +239,7 @@ struct MapFrameRateSection: View {
         Section {
             if locked {
                 let envVal = ProcessInfo.processInfo.environment["DM_MAP_FPS_MODE"] ?? "0"
-                let label = envVal == "1" ? "Lock 30 FPS" : envVal == "2" ? "30 → 60 FPS (2x MetalFX)" : "Default"
+                let label = envVal == "1" ? "Lock 30 FPS" : "Default"
                 LabeledContent("3D Map Frame Rate") {
                     Text("\(label) (env)").foregroundStyle(.secondary)
                 }
@@ -249,7 +247,6 @@ struct MapFrameRateSection: View {
                 Picker("3D Map Frame Rate", selection: $modeRaw) {
                     Text("Default").tag("0")
                     Text("Lock 30 FPS").tag("1")
-                    Text("30 → 60 FPS (2x MetalFX)").tag("2")
                 }
                 .pickerStyle(.menu)
                 .onChange(of: modeRaw) { _, _ in syncEnv() }
@@ -259,13 +256,16 @@ struct MapFrameRateSection: View {
         } footer: {
             Text(footerText)
         }
-        .onAppear { syncEnv() }
+        .onAppear {
+            if modeRaw != "0" && modeRaw != "1" { modeRaw = "0" }
+            syncEnv()
+        }
     }
 
     private func syncEnv() {
         guard !locked else { return }
-        if modeRaw == "1" || modeRaw == "2" {
-            setenv("DM_MAP_FPS_MODE", modeRaw, 1)
+        if modeRaw == "1" {
+            setenv("DM_MAP_FPS_MODE", "1", 1)
         } else {
             unsetenv("DM_MAP_FPS_MODE")
         }

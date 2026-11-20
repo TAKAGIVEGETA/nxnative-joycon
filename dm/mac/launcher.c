@@ -204,9 +204,9 @@ static void map_fps_choice(void) {
     CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("launcher.DM_MAP_FPS_MODE"), domain);
     if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
         char val[16];
-        if (CFStringGetCString(v, val, sizeof val, kCFStringEncodingUTF8) && (val[0] == '1' || val[0] == '2') && !val[1]) {
-            setenv("DM_MAP_FPS_MODE", val, 0);
-            fprintf(stderr, "launcher: env DM_MAP_FPS_MODE=%s (saved choice)\n", val);
+        if (CFStringGetCString(v, val, sizeof val, kCFStringEncodingUTF8) && val[0] == '1' && !val[1]) {
+            setenv("DM_MAP_FPS_MODE", "1", 0);
+            fprintf(stderr, "launcher: env DM_MAP_FPS_MODE=1 (saved choice)\n");
         }
     }
     if (v) CFRelease(v);
